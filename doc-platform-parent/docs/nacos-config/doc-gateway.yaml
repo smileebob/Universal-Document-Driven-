@@ -1,0 +1,33 @@
+# ============================================================
+# doc-gateway 私有配置（Nacos dataId: doc-gateway.yaml，Group: DEFAULT_GROUP，R-02）。
+# 路由表沉淀于此支持动态刷新（GW-02 验证点）；敏感值一律 ${ENV} 占位（R-05 零明文）。
+# ============================================================
+
+spring:
+  cloud:
+    gateway:
+      # Cloud 2025.0.x 响应式网关配置键（design/09 §2.2）
+      server:
+        webflux:
+          # 路由表（GW-02 语义化路由 id；uri 一律 lb://，GW-03）；
+          # 网关不做 StripPrefix；/api/v1/internal/** 不配置任何路由（A-07）
+          routes:
+            - id: meta-route
+              uri: lb://meta-service
+              predicates:
+                - Path=/api/v1/schema/**,/api/v1/rule/**,/api/v1/menu/**
+            - id: runtime-route
+              uri: lb://runtime-service
+              predicates:
+                - Path=/api/v1/data/**,/api/v1/query/**,/api/v1/audit/**,/api/v1/saga/**,/api/v1/event/**
+  web:
+    cors:
+      # 生产必须收敛为具体域名（经环境变量注入）
+      allowed-origin-patterns: ${CORS_ALLOWED_ORIGIN_PATTERNS:http://localhost:*}
+
+doc:
+  gateway:
+    auth:
+      enabled: ${GATEWAY_AUTH_ENABLED:true}
+      secret: ${GATEWAY_JWT_SECRET:}
+      skip-paths: /actuator/**

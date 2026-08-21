@@ -1,0 +1,273 @@
+{
+  "version": 1,
+  "description": "V1 基线：全平台 16 张表与多元索引定义（design/03 全文 + design/05 §saga_execution/§5.2 幂等表）。版本号只增不改，已发布定义禁改（TS-06）。注：audit_log/event_outbox 的 ttlSeconds 移除属首次真实 OTS 部署前的定义修正（真实实例本轮首次建表、尚无存量数据），不构成对已发布定义的变更。",
+  "tables": [
+    {
+      "name": "entity_schema",
+      "comment": "实体定义表（EC-01~04，配置表单键模式）",
+      "partitionMode": "PLAIN",
+      "primaryKey": [
+        { "name": "entity_code", "type": "STRING" }
+      ],
+      "searchIndexes": [
+        {
+          "name": "entity_schema_index",
+          "fields": [
+            { "name": "entity_name", "type": "TEXT" },
+            { "name": "entity_type", "type": "KEYWORD" },
+            { "name": "status", "type": "LONG" },
+            { "name": "update_time", "type": "LONG" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "entity_data",
+      "comment": "实体数据表（RD-01~04，数据表 hash 打散 {entity_code}_{hash4(uuid)}）",
+      "partitionMode": "HASH",
+      "hashLength": 4,
+      "primaryKey": [
+        { "name": "partition_key", "type": "STRING" },
+        { "name": "uuid", "type": "STRING" }
+      ],
+      "searchIndexes": [
+        {
+          "name": "entity_data_index",
+          "fields": [
+            { "name": "entity_code", "type": "KEYWORD" },
+            { "name": "entity_type", "type": "KEYWORD" },
+            { "name": "status", "type": "LONG" },
+            { "name": "creator", "type": "KEYWORD" },
+            { "name": "create_dept", "type": "KEYWORD" },
+            { "name": "create_time", "type": "LONG" },
+            { "name": "update_time", "type": "LONG" },
+            {
+              "name": "attributes",
+              "type": "NESTED",
+              "subFields": [],
+              "comment": "动态注册预留点：schema 发布时按 is_searchable 属性在线追加子字段（design/03 §4.3）"
+            },
+            { "name": "relations", "type": "NESTED", "isArray": true }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "doc_schema",
+      "comment": "单据定义表（DC-01~05，配置表单键模式）",
+      "partitionMode": "PLAIN",
+      "primaryKey": [
+        { "name": "doc_code", "type": "STRING" }
+      ],
+      "searchIndexes": [
+        {
+          "name": "doc_schema_index",
+          "fields": [
+            { "name": "doc_name", "type": "TEXT" },
+            { "name": "doc_type", "type": "LONG" },
+            { "name": "status", "type": "LONG" },
+            { "name": "update_time", "type": "LONG" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "doc_data",
+      "comment": "单据数据表（RD-05~09，{doc_code}_{hash4(uuid)}；与 history/outbox 同分区键）。doc_data_index 补 deleted 列属首次真实 OTS 部署前的定义修正（runtime QueryService 对 doc_data 查询强制注入 term(deleted=0)，缺列会被真实 OTS 拒绝；真实实例本轮首次建表、尚无存量数据），不构成对已发布定义的变更。",
+      "localTxn": true,
+      "partitionMode": "HASH",
+      "hashLength": 4,
+      "primaryKey": [
+        { "name": "partition_key", "type": "STRING" },
+        { "name": "uuid", "type": "STRING" }
+      ],
+      "searchIndexes": [
+        {
+          "name": "doc_data_index",
+          "fields": [
+            { "name": "doc_code", "type": "KEYWORD" },
+            { "name": "doc_type", "type": "LONG" },
+            { "name": "current_status", "type": "LONG" },
+            { "name": "creator", "type": "KEYWORD" },
+            { "name": "create_dept", "type": "KEYWORD" },
+            { "name": "create_time", "type": "LONG" },
+            { "name": "update_time", "type": "LONG" },
+            { "name": "deleted", "type": "LONG" },
+            {
+              "name": "attributes",
+              "type": "NESTED",
+              "subFields": [],
+              "comment": "动态注册预留点：schema 发布时按 is_searchable 属性在线追加子字段（design/03 §4.3）"
+            },
+            { "name": "relations", "type": "NESTED", "isArray": true },
+            { "name": "related_forms", "type": "NESTED", "isArray": true }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "doc_data_history",
+      "comment": "单据状态历史伴生表（RD-08，与 doc_data 同分区键，只增不改，GetRange 读取）",
+      "localTxn": true,
+      "partitionMode": "HASH",
+      "hashLength": 4,
+      "primaryKey": [
+        { "name": "partition_key", "type": "STRING" },
+        { "name": "uuid", "type": "STRING" },
+        { "name": "seq", "type": "INTEGER" }
+      ]
+    },
+    {
+      "name": "state_machine",
+      "comment": "状态机配置表（SM-01，1:1 关联单据，配置表单键模式）",
+      "partitionMode": "PLAIN",
+      "primaryKey": [
+        { "name": "doc_code", "type": "STRING" }
+      ]
+    },
+    {
+      "name": "rule_lib",
+      "comment": "规则库表（RE-01~03，rule_{hash4(rule_uuid)}）",
+      "partitionMode": "HASH",
+      "hashLength": 4,
+      "primaryKey": [
+        { "name": "partition_key", "type": "STRING" },
+        { "name": "rule_uuid", "type": "STRING" }
+      ],
+      "searchIndexes": [
+        {
+          "name": "rule_lib_index",
+          "fields": [
+            { "name": "rule_name", "type": "TEXT" },
+            { "name": "rule_type", "type": "KEYWORD" },
+            { "name": "status", "type": "LONG" },
+            { "name": "update_time", "type": "LONG" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "doc_rule_config",
+      "comment": "单据规则绑定表（RE-05，1:1 关联单据）",
+      "partitionMode": "PLAIN",
+      "primaryKey": [
+        { "name": "doc_code", "type": "STRING" }
+      ]
+    },
+    {
+      "name": "tx_config",
+      "comment": "事务步骤配置表（TX-01，1:1 关联单据）",
+      "partitionMode": "PLAIN",
+      "primaryKey": [
+        { "name": "doc_code", "type": "STRING" }
+      ]
+    },
+    {
+      "name": "menu_config",
+      "comment": "菜单挂载表（EC-05，target_key={target_type}_{target_code} 单键模式）",
+      "partitionMode": "PLAIN",
+      "primaryKey": [
+        { "name": "target_key", "type": "STRING" }
+      ]
+    },
+    {
+      "name": "audit_log",
+      "comment": "操作审计日志表（RD-12，log_{hash6(log_id)}，只增不改）。原设计 TTL 400 天，因 OTS 约束「多元索引设置 TTL 时基表必须禁止更新（append-only）」与索引检索诉求不可兼得，改为不过期；数据生命周期由定期清理/归档任务兜底（参见 design/03 §TTL 说明与 runtime.outbox.archive-enabled）",
+      "localTxn": true,
+      "partitionMode": "HASH",
+      "hashLength": 6,
+      "primaryKey": [
+        { "name": "partition_key", "type": "STRING" },
+        { "name": "log_id", "type": "STRING" }
+      ],
+      "searchIndexes": [
+        {
+          "name": "audit_log_index",
+          "fields": [
+            { "name": "target_type", "type": "KEYWORD" },
+            { "name": "target_code", "type": "KEYWORD" },
+            { "name": "target_uuid", "type": "KEYWORD" },
+            { "name": "operator", "type": "KEYWORD" },
+            { "name": "operation", "type": "KEYWORD" },
+            { "name": "operate_time", "type": "LONG" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "event_outbox",
+      "comment": "事件发件箱表（EV-01/02，与业务行同分区键）。原设计 TTL 30 天，因 OTS 约束「多元索引设置 TTL 时基表必须禁止更新（append-only）」而 send_status/retry_count 需行更新，TTL 不可行，改为不过期；数据生命周期由定期清理/归档任务兜底（参见 design/03 §TTL 说明与 runtime.outbox.archive-enabled）",
+      "localTxn": true,
+      "partitionMode": "HASH",
+      "hashLength": 4,
+      "primaryKey": [
+        { "name": "partition_key", "type": "STRING" },
+        { "name": "event_id", "type": "STRING" }
+      ],
+      "searchIndexes": [
+        {
+          "name": "event_outbox_index",
+          "fields": [
+            { "name": "send_status", "type": "LONG" },
+            { "name": "event_type", "type": "KEYWORD" },
+            { "name": "target_code", "type": "KEYWORD" },
+            { "name": "retry_count", "type": "LONG" },
+            { "name": "next_retry_time", "type": "LONG" },
+            { "name": "create_time", "type": "LONG" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "saga_execution",
+      "comment": "Saga 编排状态主表（TX-02，saga_{hash4(saga_id)}，design/05 §saga_execution）",
+      "partitionMode": "HASH",
+      "hashLength": 4,
+      "primaryKey": [
+        { "name": "partition_key", "type": "STRING" },
+        { "name": "saga_id", "type": "STRING" }
+      ]
+    },
+    {
+      "name": "saga_dead_letter",
+      "comment": "Saga 冲正失败死信表（TX-03，saga_{hash4(saga_id)}）",
+      "partitionMode": "HASH",
+      "hashLength": 4,
+      "primaryKey": [
+        { "name": "partition_key", "type": "STRING" },
+        { "name": "saga_id", "type": "STRING" }
+      ],
+      "searchIndexes": [
+        {
+          "name": "saga_dead_letter_index",
+          "fields": [
+            { "name": "handle_status", "type": "LONG" },
+            { "name": "doc_code", "type": "KEYWORD" },
+            { "name": "create_time", "type": "LONG" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "unique_index",
+      "comment": "unique 约束伴生表（design/03 §五，{target_code}_{attr_code}_{hash4(value)}，EXPECT_NOT_EXIST CAS）",
+      "partitionMode": "HASH",
+      "hashLength": 4,
+      "primaryKey": [
+        { "name": "partition_key", "type": "STRING" },
+        { "name": "unique_value", "type": "STRING" }
+      ]
+    },
+    {
+      "name": "idempotent_record",
+      "comment": "接口幂等记录表（B-01，idem_{hash4(key)}，TTL 24h，design/05 §5.2）",
+      "partitionMode": "HASH",
+      "hashLength": 4,
+      "ttlSeconds": 86400,
+      "primaryKey": [
+        { "name": "partition_key", "type": "STRING" },
+        { "name": "idempotency_key", "type": "STRING" }
+      ]
+    }
+  ]
+}

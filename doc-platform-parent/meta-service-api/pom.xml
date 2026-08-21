@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>doc-parent</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>meta-service-api</artifactId>
+    <name>meta-service-api</name>
+    <description>配置域（meta-service）对外 Feign 契约模块：@FeignClient 接口与 DTO（A-04 独立契约模块，无实现、无 Spring Boot 依赖）</description>
+
+    <!-- 契约模块依赖最小化：仅 openfeign 注解 + validation + doc-common 基类（ApiResponse/DTO 基类） -->
+    <dependencies>
+        <!-- OpenFeign 注解核心（@FeignClient 等，版本由 Spring Cloud BOM 管理） -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-openfeign-core</artifactId>
+        </dependency>
+
+        <!-- Spring Web 注解（@GetMapping/@PathVariable 等，版本由 Boot BOM 管理） -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-web</artifactId>
+        </dependency>
+
+        <!-- Bean Validation API（DTO 校验注解，版本由 Boot BOM 管理） -->
+        <dependency>
+            <groupId>jakarta.validation</groupId>
+            <artifactId>jakarta.validation-api</artifactId>
+        </dependency>
+
+        <!-- 统一响应包装 ApiResponse 与公共 DTO 基类 -->
+        <dependency>
+            <groupId>com.example</groupId>
+            <artifactId>doc-common</artifactId>
+        </dependency>
+
+        <!-- 日志门面（fallback 工厂记录降级日志；tablestore SDK 改 optional 后传递链断裂，显式声明，版本由 Boot BOM 管理） -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+        </dependency>
+    </dependencies>
+</project>

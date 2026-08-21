@@ -1,0 +1,28 @@
+# 非代码内容（只发布代码）
+design/
+prd/
+springcloud/
+springcloud-scaff/
+技术方案-通用单据驱动平台.md
+
+# 临时/本地产物
+_smoke_tmp/
+logs/
+*.log
+logs-*.txt
+_dc_inner.jar
+/*.png
+scripts/stage3-tmp/
+
+# PowerShell 脚本全部为本地测试/运维用途，不上传
+*.ps1
+
+# 构建/依赖/工具产物（兜底，与子目录 .gitignore 双层防护）
+**/target/
+**/node_modules/
+**/dist/
+*.tsbuildinfo
+*.iml
+.idea/
+.vscode/
+.qoder/

@@ -1,0 +1,130 @@
+# ============================================================
+# Placeholder defaults are for local dev only; production injects via env vars.
+# Production must not use any sensitive defaults from this file (R-05).
+# ============================================================
+server:
+  port: ${SERVER_PORT:8081}
+  shutdown: graceful
+
+spring:
+  application:
+    name: meta-service
+  jackson:
+    # Global SNAKE_CASE output (aligned with runtime-service; review fix Major-3)
+    property-naming-strategy: SNAKE_CASE
+  config:
+    # Nacos config import (SCA 2025.0.0.0 removed bootstrap support);
+    # optional prefix: startup not blocked when Nacos unreachable
+    import: optional:nacos:${spring.application.name}.yaml
+  cloud:
+    nacos:
+      server-addr: ${NACOS_SERVER_ADDR:127.0.0.1:8848}
+      discovery:
+        namespace: ${NACOS_NAMESPACE:}
+      config:
+        namespace: ${NACOS_NAMESPACE:}
+        # R-04: shared config in common.yml (Tablestore/RocketMQ client common settings)
+        shared-configs:
+          - data-id: common.yml
+            group: DEFAULT_GROUP
+            refresh: true
+    sentinel:
+      enabled: true
+      transport:
+        dashboard: ${SENTINEL_DASHBOARD:127.0.0.1:8858}
+    openfeign:
+      # Cloud 2022.0+ new prefix (legacy feign.* keys no longer bind in 2025.0.x)
+      okhttp:
+        enabled: true
+      client:
+        config:
+          default:
+            connect-timeout: 3000
+            read-timeout: 5000
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+  data:
+    redis:
+      # Production must inject REDIS_HOST/REDIS_PORT/REDIS_USERNAME/REDIS_PASSWORD via env vars
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      username: ${REDIS_USERNAME:}
+      password: ${REDIS_PASSWORD:}
+      timeout: ${REDIS_TIMEOUT_MS:2000ms}
+      connect-timeout: ${REDIS_CONNECT_TIMEOUT_MS:2000ms}
+
+# Tablestore (doc-common TablestoreProperties binding, design/08 2.5; secrets via env vars, R-05)
+doc:
+  tablestore:
+    # Assembly mode (explicit switch, phase-1 exit fix):
+    #   ots        -- default/production: real Tablestore client, fail-fast when endpoint missing;
+    #   simulation -- doc-common in-memory simulation, dev/test only (dev profile below).
+    mode: ${OTS_MODE:ots}
+    endpoint: ${OTS_ENDPOINT:}
+    instance: ${OTS_INSTANCE:}
+    access-key-id: ${OTS_ACCESS_KEY_ID:}
+    access-key-secret: ${OTS_ACCESS_KEY_SECRET:}
+    connection-timeout-ms: 3000
+    socket-timeout-ms: 5000
+    max-connections: 64          # TS-07 client parameter governance
+    bootstrap:
+      auto-create: ${OTS_AUTO_CREATE:false}
+  # Two-level cache (design/06 5.1; L2 Caffeine 5min+/-10% / L1 Redis 60min+/-10% / null placeholder 30s / rebuild lock 3s + 50ms poll)
+  cache:
+    l1-ttl-minutes: ${DOC_CACHE_L1_TTL_MINUTES:60}
+    l2-ttl-minutes: ${DOC_CACHE_L2_TTL_MINUTES:5}
+    null-ttl-seconds: 30
+    rebuild-lock-ttl-seconds: 3
+    rebuild-wait-millis: 50
+    rebuild-max-waits: 3
+    jitter-percent: 10
+    maximum-size: 1000
+    warmup-enabled: ${DOC_CACHE_WARMUP_ENABLED:true}
+  # MQ facade dual mode (phase-3 task item 1):
+  #   mock     -- default: in-process Producer/Consumer simulation + Redis Pub/Sub
+  #               cross-instance bridge, for local demo / integration tests;
+  #   rocketmq -- real rocketmq-spring-boot-starter assembly (requires ROCKETMQ_ENDPOINT).
+  # Business code only depends on the DocMessagePublisher facade (anti-corruption).
+  mq:
+    mode: ${DOC_MQ_MODE:mock}
+    # Publish invalidation broadcast switch (BC-03: fallback to Caffeine TTL when MQ unavailable)
+    schema-invalidation:
+      enabled: ${DOC_SCHEMA_INVALIDATION_MQ:true}
+
+# RocketMQ (schema publish cache invalidation broadcast produce/consume; secrets via env vars, R-05)
+rocketmq:
+  name-server: ${ROCKETMQ_ENDPOINT:}
+  producer:
+    group: ${spring.application.name}-pg
+    access-key: ${ROCKETMQ_ACCESS_KEY:}
+    secret-key: ${ROCKETMQ_SECRET_KEY:}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+---
+# ============================================================
+# dev profile: no Tablestore cloud instance (phase-1 exit fix).
+# Starts in simulation mode: in-memory storage + auto create tables/indexes.
+# Activate: SPRING_PROFILES_ACTIVE=dev (credentials only via env vars).
+# ============================================================
+spring:
+  config:
+    activate:
+      on-profile: dev
+
+doc:
+  tablestore:
+    # dev defaults to simulation; inject OTS_MODE=ots to switch to real OTS
+    # (paired with OTS_ENDPOINT/OTS_INSTANCE/OTS_ACCESS_KEY_* and OTS_AUTO_CREATE)
+    mode: ${OTS_MODE:simulation}
+    bootstrap:
+      # Simulation mode always auto-creates tables (in-memory store empty on restart)
+      auto-create: true

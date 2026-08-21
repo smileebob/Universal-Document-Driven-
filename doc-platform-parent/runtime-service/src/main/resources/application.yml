@@ -1,0 +1,166 @@
+# ============================================================
+# 占位默认值仅供本地开发，生产一律经环境变量注入。
+# 生产环境禁止使用本文件中的任何默认敏感配置（R-05：敏感值环境变量注入，Nacos 零明文）。
+# ============================================================
+server:
+  port: ${SERVER_PORT:8082}
+  # 优雅停机
+  shutdown: graceful
+
+spring:
+  application:
+    name: runtime-service
+  # design/09 §3.1：JSON 字段命名统一 snake_case（报文基线 PRD 11）
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+  config:
+    # Nacos 配置导入（SCA 2025.0.0.0 已移除 bootstrap 支持，不建 bootstrap.yml）；
+    # optional 前缀：Nacos 不可达时不阻断启动（生产可去掉 optional 改为强依赖）
+    import: optional:nacos:${spring.application.name}.yaml
+  cloud:
+    nacos:
+      # Nacos 服务地址（discovery 与 config 共用，可分别覆盖）
+      server-addr: ${NACOS_SERVER_ADDR:127.0.0.1:8848}
+      discovery:
+        namespace: ${NACOS_NAMESPACE:}
+      config:
+        namespace: ${NACOS_NAMESPACE:}
+        # R-04：公共配置沉淀至 common.yml（Tablestore/RocketMQ 客户端公共配置），经 shared-configs 引入
+        shared-configs:
+          - data-id: common.yml
+            group: DEFAULT_GROUP
+            refresh: true
+    sentinel:
+      enabled: true
+      transport:
+        # Sentinel 控制台地址占位（未部署控制台时不影响限流规则本地生效）
+        dashboard: ${SENTINEL_DASHBOARD:127.0.0.1:8858}
+      # Sentinel 规则持久化模板（规范要求：Nacos 为唯一规则源，控制台仅监控）。
+      # 接入时取消注释，并在 pom 中启用 sentinel-datasource-nacos 依赖（见注释）；
+      # dataId 约定：${spring.application.name}-flow-rules / -degrade-rules。
+      #datasource:
+      #  flow-rules:
+      #    nacos:
+      #      server-addr: ${NACOS_SERVER_ADDR:127.0.0.1:8848}
+      #      namespace: ${NACOS_NAMESPACE:}
+      #      data-id: ${spring.application.name}-flow-rules
+      #      group-id: SENTINEL_GROUP
+      #      data-type: json
+      #      rule-type: flow
+      #  degrade-rules:
+      #    nacos:
+      #      server-addr: ${NACOS_SERVER_ADDR:127.0.0.1:8848}
+      #      namespace: ${NACOS_NAMESPACE:}
+      #      data-id: ${spring.application.name}-degrade-rules
+      #      group-id: SENTINEL_GROUP
+      #      data-type: json
+      #      rule-type: degrade
+    openfeign:
+      # Cloud 2022.0+ 新前缀（旧 feign.* 键在 2025.0.x 下不再绑定）：OkHttp 客户端 + 超时（connect 3s / read 5s）
+      okhttp:
+        enabled: true
+      client:
+        config:
+          default:
+            connect-timeout: 3000
+            read-timeout: 5000
+  lifecycle:
+    # 优雅停机等待时长，须小于部署脚本强杀超时（deploy/app.sh WAIT_TIMEOUT）
+    timeout-per-shutdown-phase: 30s
+  # 无 JDBC 数据源：spring.datasource.* 已随 Tablestore 替代方案整体移除（design/08 §2.3）
+  data:
+    redis:
+      # 生产必须经环境变量注入 REDIS_HOST/REDIS_PORT/REDIS_USERNAME/REDIS_PASSWORD（ACL 账号模式需 username）
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      username: ${REDIS_USERNAME:}
+      password: ${REDIS_PASSWORD:}
+      # 超时（Duration 格式：纯数字按毫秒解析；环境变量注入毫秒数即可）
+      timeout: ${REDIS_TIMEOUT_MS:2000ms}
+      connect-timeout: ${REDIS_CONNECT_TIMEOUT_MS:2000ms}
+
+# 新增：Tablestore（经 doc-common TablestoreProperties 绑定，design/08 §2.5；敏感值走环境变量，R-05）
+doc:
+  tablestore:
+    # 装配模式（显式开关，阶段一出口修复引入）：
+    #   ots        —— 缺省/生产口径：装配真实 Tablestore 客户端，
+    #                 要求 endpoint/instance 齐全（环境变量 OTS_ENDPOINT/OTS_INSTANCE 注入），
+    #                 缺失时启动 fail-fast 并给出清晰错误提示；
+    #   simulation —— doc-common 主类路径 InMemory 仿真实现，启动即按 V*.json 自动建表建索引，
+    #                 仅在 spring profile 含 dev/test/sim 时允许（见文末 dev 段），
+    #                 生产 profile 下显式拒绝并启动失败，防止误用。
+    mode: ${OTS_MODE:ots}
+    endpoint: ${OTS_ENDPOINT:}
+    instance: ${OTS_INSTANCE:}
+    access-key-id: ${OTS_ACCESS_KEY_ID:}
+    access-key-secret: ${OTS_ACCESS_KEY_SECRET:}
+    connection-timeout-ms: 3000
+    socket-timeout-ms: 5000
+    max-connections: 64          # TS-07 客户端参数治理
+    bootstrap:
+      auto-create: ${OTS_AUTO_CREATE:false}   # dev/test 启动自动建表；生产由流水线显式执行（TS-06）
+  # 消息门面双模式（任务 #16 决策：本机无 Docker 开源 RocketMQ，双模式防腐）：
+  #   mock     —— 进程内 InMemoryMessageBroker 仿真（广播/顺序语义近似）+ Redis Pub/Sub 跨实例桥接；
+  #   rocketmq —— rocketmq-spring-boot-starter 真实装配（生产，需 rocketmq.name-server 配置）。
+  mq:
+    mode: ${DOC_MQ_MODE:mock}
+  # 阶段三：Saga 编排器参数（design/05 §2.5 / design/08 §3.3）
+  runtime:
+    saga:
+      total-budget-ms: 60000          # Saga 总预算 ≤60s（超时中止转冲正）
+      stuck-threshold-ms: 300000      # EXECUTING 超 5min 视为卡死，崩溃恢复续推
+      recovery-enabled: true
+      recovery-interval-ms: 60000
+    # 阶段三：Transactional Outbox 中继参数（design/07 §四）
+    outbox:
+      scan-interval-ms: 5000          # 5s 定时扫描兜底（即时首发之外的滞留行）
+      scan-initial-delay-ms: 10000
+      archive-enabled: false          # 已发送行 7 天归档清理默认关（骨架）
+      archive-interval-ms: 3600000
+
+# 新增：RocketMQ（Outbox 中继投递 + schema 缓存失效广播消费；敏感值走环境变量，R-05）
+rocketmq:
+  # 阿里云 RocketMQ 实例接入点（name-server 语义）
+  name-server: ${ROCKETMQ_ENDPOINT:}
+  producer:
+    group: ${spring.application.name}-pg
+    access-key: ${ROCKETMQ_ACCESS_KEY:}
+    secret-key: ${ROCKETMQ_SECRET_KEY:}
+
+# 新增：运行域对账任务（unique_index 孤儿占位对账，design/03 §5.6；leader 阶段二补项）
+runtime:
+  reconcile:
+    unique-orphan:
+      # 定时对账开关（默认 false；手动触发接口不受开关限制，并发执行返回 40901）
+      enabled: ${RECONCILE_UNIQUE_ORPHAN:false}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+---
+# ============================================================
+# dev profile：无 Tablestore 云实例环境（阶段一出口修复）。
+# 以 simulation 模式启动：InMemory 仿真存储 + 启动自动建表建索引，
+# 支撑 dev 环境端到端联调。生产 profile 不继承本段，保持 mode=ots。
+# 激活方式：SPRING_PROFILES_ACTIVE=dev（凭据一律经环境变量注入，不落文件）。
+# ============================================================
+spring:
+  config:
+    activate:
+      on-profile: dev
+
+doc:
+  tablestore:
+    # dev 默认仿真；注入 OTS_MODE=ots 可切真实 OTS
+    # （配合 OTS_ENDPOINT/OTS_INSTANCE/OTS_ACCESS_KEY_* 与 OTS_AUTO_CREATE）
+    mode: ${OTS_MODE:simulation}
+    bootstrap:
+      # 仿真模式启动一律自动建表（内存存储重启即空）；此处显式置 true 保持语义自解释
+      auto-create: true

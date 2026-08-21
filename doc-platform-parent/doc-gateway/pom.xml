@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>doc-parent</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>doc-gateway</artifactId>
+    <name>doc-gateway</name>
+    <description>API 网关（WebFlux 响应式，端口 8080）：唯一外部入口，路由、JWT 认证、限流、审计埋点（A-07，GW 系列），无持久化，禁连 Tablestore</description>
+
+    <!-- 注意：网关基于 WebFlux（spring-cloud-starter-gateway），
+         严禁引入 spring-boot-starter-web，二者不可共存。 -->
+    <dependencies>
+        <!-- OpenAPI 文档快照（任务 #20 步骤 6：openapi.json 归档 docs/openapi/） -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webflux-ui</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.example</groupId>
+            <artifactId>doc-common</artifactId>
+        </dependency>
+
+        <!-- 响应式网关（Spring Cloud Gateway WebFlux） -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-gateway</artifactId>
+        </dependency>
+
+        <!-- 服务注册与配置中心（Nacos）；SCA 2025.0.0.0 已移除 bootstrap 支持，
+             配置导入走 application.yml 的 spring.config.import: optional:nacos:... -->
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-starter-alibaba-nacos-discovery</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-starter-alibaba-nacos-config</artifactId>
+        </dependency>
+
+        <!-- 负载均衡（lb:// 路由目标解析） -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-loadbalancer</artifactId>
+        </dependency>
+
+        <!-- 限流降级（Sentinel）及网关适配器（版本由 SCA BOM 管理）；
+             Cloud 2025.0.x（Gateway 4.x/Spring 6）须用 v6x 适配器，旧版 sentinel-spring-cloud-gateway-adapter 已不兼容 -->
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-starter-alibaba-sentinel</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.alibaba.csp</groupId>
+            <artifactId>sentinel-spring-cloud-gateway-v6x-adapter</artifactId>
+        </dependency>
+        <!-- Sentinel 规则持久化到 Nacos（规范要求：Nacos 为唯一规则源，控制台仅监控）。
+             默认不激活；接入时取消注释（版本由 SCA BOM 管理），
+             并在 application.yml 中启用 sentinel datasource 配置模板（见注释）。 -->
+        <!--
+        <dependency>
+            <groupId>com.alibaba.csp</groupId>
+            <artifactId>sentinel-datasource-nacos</artifactId>
+        </dependency>
+        -->
+
+        <!-- JWT 认证（AuthGlobalFilter 校验令牌并透传 X-User-Id/X-User-Roles，版本由父 POM 锁定） -->
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-impl</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-jackson</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- 可观测 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
+        <!-- 测试依赖（版本由 spring-boot BOM 管理） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- 独立可运行应用：repackage 为可执行 fat jar -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

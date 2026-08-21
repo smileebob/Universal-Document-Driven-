@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>doc-parent</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>doc-common</artifactId>
+    <name>doc-common</name>
+    <description>无状态公共模块：ApiResponse、BizException/ErrorCode、TablestoreTemplate 防腐层、两级缓存骨架、规则执行器、MQ 门面双模式、常量与工具类（禁止写业务）</description>
+
+    <dependencies>
+        <!-- Tablestore SDK：防腐层编译期引入点（版本由父 POM 锁定），
+             optional=true 不向下游传递：meta-service / runtime-service 在各自 POM
+             显式引入，doc-gateway 等无存储需求模块 classpath 天然无 SyncClient，
+             TablestoreAutoConfiguration 的 @ConditionalOnClass(SyncClient) 不命中、
+             整组装配跳过（评审修复 Critical-1：网关装配泄漏隔离，design/08 §2.3） -->
+        <dependency>
+            <groupId>com.aliyun.openservices</groupId>
+            <artifactId>tablestore</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- JSON 序列化（attributes 列与消息体），版本由 Boot BOM 管理 -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+
+        <!-- 自动装配基座：TablestoreAutoConfiguration / CommonWebAutoConfiguration /
+             CacheAutoConfiguration / DocMqAutoConfiguration 经
+             META-INF/spring/...AutoConfiguration.imports 注册（Boot 3 风格） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-autoconfigure</artifactId>
+        </dependency>
+
+        <!-- Web MVC（GlobalExceptionHandler @RestControllerAdvice 编译需要）。
+             optional：不传递给业务模块，服务侧本就引入 spring-boot-starter-web -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-webmvc</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Bean Validation API（ConstraintViolationException 映射需要）。
+             optional：服务侧经 spring-boot-starter-validation 引入实现 -->
+        <dependency>
+            <groupId>jakarta.validation</groupId>
+            <artifactId>jakarta.validation-api</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Actuator 核心（TablestoreHealthIndicator 编译需要，J-05 变通）。
+             optional：服务侧已引入 spring-boot-starter-actuator -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-actuator</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Micrometer 核心（任务 #20：TablestoreTemplate/缓存指标打点编译需要，
+             design/11 §4.2）；actuator 内为 optional 不传递，此处显式声明。
+             optional：服务侧经 starter-actuator + micrometer-registry-prometheus 已含 -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-core</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Caffeine 本地缓存（两级缓存 L2；阶段二自 meta-service 下沉）。
+             optional：使用方（meta/runtime）自行显式引入 -->
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Redis 客户端基座（缓存/分布式锁/mock MQ 桥接公共能力装配用，可选传递） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- RocketMQ Spring Boot Starter（MQ 门面 rocketmq 模式编译需要，阶段三）。
+             optional=true 不向下游传递：meta-service / runtime-service 各自 POM
+             已显式引入；doc-gateway classpath 无该类，
+             DocMqAutoConfiguration 的 @ConditionalOnClass(RocketMQTemplate) 不命中 -->
+        <dependency>
+            <groupId>org.apache.rocketmq</groupId>
+            <artifactId>rocketmq-spring-boot-starter</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- SpEL 表达式（规则执行器沙箱求值，spring-expression 由 Boot BOM 管理）。
+             optional：仅规则引擎使用方需要运行时类路径（meta/runtime 经 web starter 已含 spring-context） -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-expression</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- 测试依赖（版本由 spring-boot BOM 管理） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Servlet API（RoleCheckInterceptor 等 Servlet 栈组件编译需要）。
+             optional=true 不向下游传递：doc-gateway 为 WebFlux 栈 classpath 无 servlet，
+             RoleCheckAutoConfiguration 的 SERVLET 条件不命中；meta/runtime 经 web starter 自带 -->
+        <dependency>
+            <groupId>jakarta.servlet</groupId>
+            <artifactId>jakarta.servlet-api</artifactId>
+            <optional>true</optional>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- InMemoryTablestore 仿真实现本体已提升至 src/main（mode=simulation
+                 显式开关装配，阶段一出口修复）；test-jar 继续保留，载本模块测试
+                 工具类供 meta-service / runtime-service 的 Repository 级测试复用
+                 （design/08 §七：无云实例时的唯一存储测试手段） -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>test-jar</id>
+                        <goals>
+                            <goal>test-jar</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!-- JaCoCo 门禁（相对父 POM 的模块级调整，仅影响 doc-common）：
+                 1) 排除 ots 子包——真实 SyncClient 适配层（OtsTablestoreTemplate/
+                    OtsQueryTranslator）在无云实例环境不可测，其语义等价性由
+                    InMemoryTablestore 门面测试 + 发布前测试实例验证覆盖（K-03 变通）；
+                 2) BUNDLE 行覆盖率门禁保持 0.60，未全局放宽。 -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>com/example/common/infrastructure/tablestore/ots/**</exclude>
+                    </excludes>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>check</id>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <rule>
+                                    <element>BUNDLE</element>
+                                    <limits>
+                                        <limit>
+                                            <counter>LINE</counter>
+                                            <value>COVEREDRATIO</value>
+                                            <minimum>0.60</minimum>
+                                        </limit>
+                                    </limits>
+                                </rule>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

@@ -1,0 +1,90 @@
+# ============================================================
+# 占位默认值仅供本地开发，生产一律经环境变量注入。
+# 生产环境禁止使用本文件中的任何默认敏感配置（R-05：敏感值环境变量注入，Nacos 零明文）。
+# ============================================================
+server:
+  port: ${SERVER_PORT:8080}
+  # 优雅停机
+  shutdown: graceful
+
+spring:
+  application:
+    name: doc-gateway
+  config:
+    # Nacos 配置导入（SCA 2025.0.0.0 已移除 bootstrap 支持，不建 bootstrap.yml）；
+    # optional 前缀：Nacos 不可达时不阻断启动（生产可去掉 optional 改为强依赖）。
+    # 路由表沉淀于 Nacos doc-gateway.yaml 支持动态刷新（GW-02 验证点）
+    import: optional:nacos:${spring.application.name}.yaml
+  cloud:
+    nacos:
+      server-addr: ${NACOS_SERVER_ADDR:127.0.0.1:8848}
+      discovery:
+        namespace: ${NACOS_NAMESPACE:}
+      config:
+        namespace: ${NACOS_NAMESPACE:}
+    sentinel:
+      enabled: true
+      transport:
+        # Sentinel 控制台地址占位（未部署控制台时不影响限流规则本地生效）
+        dashboard: ${SENTINEL_DASHBOARD:127.0.0.1:8858}
+      # Sentinel 网关规则持久化模板（规范要求：Nacos 为唯一规则源，控制台仅监控）。
+      # 接入时取消注释，并在 pom 中启用 sentinel-datasource-nacos 依赖（见注释）；
+      # dataId 约定：${spring.application.name}-gw-flow-rules。
+      #datasource:
+      #  gw-flow-rules:
+      #    nacos:
+      #      server-addr: ${NACOS_SERVER_ADDR:127.0.0.1:8848}
+      #      namespace: ${NACOS_NAMESPACE:}
+      #      data-id: ${spring.application.name}-gw-flow-rules
+      #      group-id: SENTINEL_GROUP
+      #      data-type: json
+      #      rule-type: gw-flow
+    gateway:
+      # Cloud 2025.0.x 起响应式网关配置迁移至 server.webflux 命名空间（design/09 §2.2）
+      server:
+        webflux:
+          # 路由表（GW-02：语义化路由 id；uri 一律 lb:// 经 Nacos 服务发现 + 负载均衡，GW-03）；
+          # 网关不做 StripPrefix（服务内 Controller 映射路径本身含 /api/v1 前缀）；
+          # /api/v1/internal/** 不配置任何路由（A-07），外部请求该前缀一律 404，仅内网 Feign 直达
+          routes:
+            - id: meta-route
+              uri: lb://meta-service
+              predicates:
+                - Path=/api/v1/schema/**,/api/v1/rule/**,/api/v1/menu/**
+            - id: runtime-route
+              uri: lb://runtime-service
+              predicates:
+                - Path=/api/v1/data/**,/api/v1/query/**,/api/v1/audit/**,/api/v1/saga/**,/api/v1/event/**
+  lifecycle:
+    # 优雅停机等待时长，须小于部署脚本强杀超时（deploy/app.sh WAIT_TIMEOUT）
+    timeout-per-shutdown-phase: 30s
+  # CORS 全局配置（网关统一处理，下游服务不再重复配置）。
+  # 注意：allowed-origins=* 与 allow-credentials=true 是非法组合（Spring 会拒绝），
+  # 故用 allowed-origin-patterns；生产必须收敛为具体域名（经环境变量注入）。
+  web:
+    cors:
+      allowed-origin-patterns: ${CORS_ALLOWED_ORIGIN_PATTERNS:http://localhost:*}
+      allowed-methods: GET,POST,PUT,DELETE,OPTIONS
+      allowed-headers: "*"
+      allow-credentials: true
+      max-age: 3600
+
+# 网关认证配置（AuthGlobalFilter 绑定；放行规则从简、留扩展点）
+doc:
+  gateway:
+    auth:
+      enabled: ${GATEWAY_AUTH_ENABLED:true}
+      # JWT 签名密钥（HS256，生产经环境变量注入，R-05 零明文）
+      secret: ${GATEWAY_JWT_SECRET:}
+      # 放行路径前缀（Ant 风格；健康检查固定放行，扩展点按需追加）
+      skip-paths: /actuator/**
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true

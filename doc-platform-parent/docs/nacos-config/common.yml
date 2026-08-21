@@ -1,0 +1,34 @@
+# ============================================================
+# doc-platform 集群公共配置（R-04 共享配置分层：common.yml < 服务私有配置）。
+# 内容：Tablestore / RocketMQ 客户端公共配置沉淀（design/08 §2.1 步骤 6）。
+# 加载方式：meta-service / runtime-service 经
+#   spring.cloud.nacos.config.shared-configs: [{data-id: common.yml, refresh: true}]
+# 引入；doc-gateway 禁连 Tablestore，不引入本配置。
+# 安全约定（R-05）：敏感值一律 ${ENV} 占位，主机环境变量/密钥管理注入，Nacos 零明文。
+# ============================================================
+
+doc:
+  tablestore:
+    # Tablestore 实例接入点与实例名（经环境变量注入）
+    endpoint: ${OTS_ENDPOINT:}
+    instance: ${OTS_INSTANCE:}
+    # RAM 子账号 AK/SK（各服务 RAM 策略限制只能访问本服务独占表，design/08 §1.1）
+    access-key-id: ${OTS_ACCESS_KEY_ID:}
+    access-key-secret: ${OTS_ACCESS_KEY_SECRET:}
+    # 客户端参数治理（TS-07）
+    connection-timeout-ms: 3000
+    socket-timeout-ms: 5000
+    max-connections: 64
+    bootstrap:
+      # dev/test 启动自动建表（存在即校验、缺失即创建）；生产由流水线显式执行（TS-06）
+      auto-create: ${OTS_AUTO_CREATE:false}
+
+rocketmq:
+  # 阿里云 RocketMQ 实例接入点（name-server 语义，集群共用）
+  name-server: ${ROCKETMQ_ENDPOINT:}
+  producer:
+    # AK/SK 集群共用；group 由各服务私有配置覆盖为 ${spring.application.name}-pg
+    access-key: ${ROCKETMQ_ACCESS_KEY:}
+    secret-key: ${ROCKETMQ_SECRET_KEY:}
+    # 同步发送默认超时（Outbox 中继确认语义，design/07）
+    send-message-timeout: 3000

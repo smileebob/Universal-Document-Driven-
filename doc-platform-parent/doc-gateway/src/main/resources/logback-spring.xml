@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  日志配置（对齐可观测规范 J-01：日志必须含 traceId 便于全链路追踪）。
+  traceId/spanId 由 Micrometer Tracing 自动写入 MDC，未接入时输出为空串（%X{traceId:-}）。
+  定案口径：默认选 Brave bridge，MDC 键为 camelCase（traceId/spanId）；若改用 OTel bridge 则为 trace_id/span_id。
+  日志路径可用 LOG_PATH 属性覆盖，默认 logs/。
+
+  注意事项：
+  1. 本文件生效后，application.yml 中的 logging.* 属性不再起作用，
+     日志相关调整请统一在本文件进行。
+  2. APP_NAME 属性须随派生项目改名同步修改（影响日志文件名）。
+  3. jar + stdout 重定向部署（如 app.sh 将 stdout 重定向到 logs/）下，
+     prod 环境可移除 CONSOLE appender-ref，避免日志双写。
+-->
+<configuration scan="true" scanPeriod="60 seconds">
+
+    <!-- 日志路径，可经 -DLOG_PATH 或环境变量覆盖 -->
+    <property name="LOG_PATH" value="${LOG_PATH:-logs}"/>
+    <property name="APP_NAME" value="doc-gateway"/>
+
+    <!-- 统一输出格式：时间/级别/线程/traceId/spanId/logger/消息 -->
+    <property name="LOG_PATTERN"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] [%X{traceId:-},%X{spanId:-}] %logger{36} - %msg%n"/>
+
+    <!-- 控制台输出 -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${LOG_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- 滚动文件输出：按天滚动 + 单文件 100MB 上限 + 保留 15 天 -->
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_PATH}/${APP_NAME}.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_PATH}/${APP_NAME}.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <maxFileSize>100MB</maxFileSize>
+            <maxHistory>15</maxHistory>
+            <totalSizeCap>5GB</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${LOG_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- 生产环境同时输出到控制台与文件，其他环境仅控制台（保持简单） -->
+    <springProfile name="prod">
+        <root level="INFO">
+            <appender-ref ref="CONSOLE"/>
+            <appender-ref ref="FILE"/>
+        </root>
+    </springProfile>
+    <springProfile name="!prod">
+        <root level="INFO">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+    </springProfile>
+
+</configuration>

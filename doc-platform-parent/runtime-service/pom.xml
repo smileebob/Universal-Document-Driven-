@@ -1,0 +1,180 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>doc-parent</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>runtime-service</artifactId>
+    <name>runtime-service</name>
+    <description>运行域微服务：数据 CRUD、五类校验、状态流转（锁+规则+Saga）、统一查询、Outbox 事件、审计、运营监控（端口 8082）</description>
+
+    <dependencies>
+        <!-- OpenAPI 文档快照（任务 #20 步骤 6：openapi.json 归档 docs/openapi/） -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+        </dependency>
+
+        <!-- 公共模块（含 TablestoreTemplate 防腐层，唯一 Tablestore 访问入口） -->
+        <dependency>
+            <groupId>com.example</groupId>
+            <artifactId>doc-common</artifactId>
+        </dependency>
+
+        <!-- Tablestore SDK 显式引入：doc-common 侧为 optional 不传递，
+             本服务为存储使用方必须显式声明（版本由父 POM 锁定，
+             评审修复 Critical-1：网关 classpath 隔离） -->
+        <dependency>
+            <groupId>com.aliyun.openservices</groupId>
+            <artifactId>tablestore</artifactId>
+        </dependency>
+
+        <!-- 本服务对外 Feign 契约（InternalDataController 实现契约保证路径一致） -->
+        <dependency>
+            <groupId>com.example</groupId>
+            <artifactId>runtime-service-api</artifactId>
+        </dependency>
+
+        <!-- 对方服务契约（A-04：校验链/流转取 schema 经 MetaSchemaClient 回源） -->
+        <dependency>
+            <groupId>com.example</groupId>
+            <artifactId>meta-service-api</artifactId>
+        </dependency>
+
+        <!-- Web / 校验 / 缓存 / 可观测（Tablestore 替代 MySQL/JPA，已移除 data-jpa 与 mysql-connector-j） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+        <!-- Caffeine：schema 两级缓存 L2（doc-common 缓存骨架 optional 依赖，使用方显式引入） -->
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+        </dependency>
+        <!-- Redisson：单据流转分布式锁 L1（design/05 §1.1，版本由父 POM 锁定） -->
+        <dependency>
+            <groupId>org.redisson</groupId>
+            <artifactId>redisson-spring-boot-starter</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
+        <!-- 服务注册与配置中心（Nacos）；SCA 2025.0.0.0 已移除 bootstrap 支持，
+             配置导入走 application.yml 的 spring.config.import: optional:nacos:... -->
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-starter-alibaba-nacos-discovery</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-starter-alibaba-nacos-config</artifactId>
+        </dependency>
+
+        <!-- 服务间调用（OpenFeign + 负载均衡）与限流降级（Sentinel） -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-openfeign</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-loadbalancer</artifactId>
+        </dependency>
+        <!-- Feign 底层 HTTP 客户端切换为 OkHttp（版本由 Spring Cloud BOM 管理） -->
+        <dependency>
+            <groupId>io.github.openfeign</groupId>
+            <artifactId>feign-okhttp</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-starter-alibaba-sentinel</artifactId>
+        </dependency>
+        <!-- Sentinel 规则持久化到 Nacos（规范要求：Nacos 为唯一规则源，控制台仅监控）。
+             默认不激活；接入时取消注释（版本由 SCA BOM 管理），
+             并在 application.yml 中启用 sentinel datasource 配置模板（见注释）。 -->
+        <!--
+        <dependency>
+            <groupId>com.alibaba.csp</groupId>
+            <artifactId>sentinel-datasource-nacos</artifactId>
+        </dependency>
+        -->
+
+        <!-- RocketMQ：Outbox 中继投递 + schema 缓存失效广播消费（design/07）。
+             版本由父 POM 锁定 rocketmq-spring.version -->
+        <dependency>
+            <groupId>org.apache.rocketmq</groupId>
+            <artifactId>rocketmq-spring-boot-starter</artifactId>
+        </dependency>
+
+        <!-- Seata 分布式事务：本平台以 Tablestore 局部事务 + 编排式 Saga 替代（design/08 §3.2/3.3），
+             依赖保持注释态且永不启用（design/08 §2.1 步骤 8），seata/ 目录已删除。
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-starter-alibaba-seata</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.seata</groupId>
+            <artifactId>seata-spring-boot-starter</artifactId>
+        </dependency>
+        -->
+
+        <!-- 测试依赖（版本由 spring-boot BOM 管理） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- ArchUnit 架构守护（四层单向依赖 / 跨服务仅 api 包 / SDK import 禁令 / 无循环包依赖） -->
+        <dependency>
+            <groupId>com.tngtech.archunit</groupId>
+            <artifactId>archunit-junit5</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- doc-common InMemoryTablestore 仿真层（test-jar）：Repository 级测试唯一存储测试手段 -->
+        <dependency>
+            <groupId>com.example</groupId>
+            <artifactId>doc-common</artifactId>
+            <version>${project.version}</version>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- 独立可运行应用：repackage 为可执行 fat jar -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

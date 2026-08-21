@@ -1,0 +1,264 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- 随最新 Spring Boot 3.5.x 调整 -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.5.16</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.example</groupId>
+    <artifactId>doc-parent</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>doc-platform-parent</name>
+    <description>通用单据驱动平台微服务聚合父 POM（禁止写业务）</description>
+
+    <licenses>
+        <license>
+            <name>GNU General Public License v3.0 or later</name>
+            <url>https://www.gnu.org/licenses/gpl-3.0.txt</url>
+        </license>
+    </licenses>
+
+    <properties>
+        <java.version>17</java.version>
+        <!-- 源码/资源统一 UTF-8（评审修复：消除平台默认编码导致的中文不一致） -->
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+        <!-- 版本三元组：Boot 3.5.x / Cloud 2025.0.x / SCA 2025.0.0.0，与 SCA 官方兼容矩阵对齐 -->
+        <spring-cloud.version>2025.0.3</spring-cloud.version>
+        <spring-cloud-alibaba.version>2025.0.0.0</spring-cloud-alibaba.version>
+        <!-- 以下版本均为占位，随对应组件最新稳定版调整
+             （Sentinel/Nacos client 由 SCA BOM 管理，子模块不写版本） -->
+        <redisson.version>3.37.0</redisson.version>
+        <jjwt.version>0.12.6</jjwt.version>
+        <springdoc.version>2.8.17</springdoc.version>
+        <archunit.version>1.3.0</archunit.version>
+        <testcontainers-bom.version>1.20.4</testcontainers-bom.version>
+        <mapstruct.version>1.5.5.Final</mapstruct.version>
+        <!-- Tablestore SDK（无官方 Spring Boot Starter，防腐层落地 doc-common，见 design/08 §2.7）；
+             随官方最新稳定版调整；doc-common 以 optional 引入（不传递），
+             存储使用方（meta/runtime）在各自 POM 显式声明，网关等模块 classpath 隔离 -->
+        <tablestore.version>5.17.4</tablestore.version>
+        <!-- RocketMQ Spring Boot Starter（Outbox 中继 + 缓存失效广播），随官方最新稳定版调整 -->
+        <rocketmq-spring.version>2.3.3</rocketmq-spring.version>
+        <!-- JaCoCo 覆盖率（对齐规范 11-Testing-Rules K-01） -->
+        <jacoco.version>0.8.12</jacoco.version>
+        <jacoco.skip>false</jacoco.skip>
+        <!-- surefire argLine 空兑底：jacoco prepare-agent 以 late-binding 覆写 @{argLine}；
+             jacoco.skip=true 时该属性保持空串，surefire 仍可解析（评审修复 Major-2） -->
+        <argLine/>
+    </properties>
+
+    <!-- 不设 app-bootstrap 聚合模块：每个域服务均为独立可运行的 Spring Boot 应用 -->
+    <modules>
+        <module>doc-common</module>
+        <module>meta-service-api</module>
+        <module>runtime-service-api</module>
+        <module>doc-gateway</module>
+        <module>meta-service</module>
+        <module>runtime-service</module>
+    </modules>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- Spring Cloud BOM（先 import，优先于 SCA BOM） -->
+            <dependency>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>${spring-cloud.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- Spring Cloud Alibaba BOM（管理 Sentinel/Nacos client 版本） -->
+            <dependency>
+                <groupId>com.alibaba.cloud</groupId>
+                <artifactId>spring-cloud-alibaba-dependencies</artifactId>
+                <version>${spring-cloud-alibaba.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+            <!-- 内部模块（统一 ${project.version}） -->
+            <dependency>
+                <groupId>com.example</groupId>
+                <artifactId>doc-common</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.example</groupId>
+                <artifactId>meta-service-api</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.example</groupId>
+                <artifactId>runtime-service-api</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+
+            <!-- Tablestore SDK：唯一 NoSQL 存储客户端，经 doc-common 防腐层收口（F-06）；
+                 doc-common 侧 optional 不传递，meta/runtime 显式引入（评审修复 Critical-1） -->
+            <dependency>
+                <groupId>com.aliyun.openservices</groupId>
+                <artifactId>tablestore</artifactId>
+                <version>${tablestore.version}</version>
+            </dependency>
+
+            <!-- RocketMQ Spring Boot Starter：Outbox 投递 / 缓存失效广播（design/07） -->
+            <dependency>
+                <groupId>org.apache.rocketmq</groupId>
+                <artifactId>rocketmq-spring-boot-starter</artifactId>
+                <version>${rocketmq-spring.version}</version>
+            </dependency>
+
+            <!-- Redisson -->
+            <dependency>
+                <groupId>org.redisson</groupId>
+                <artifactId>redisson-spring-boot-starter</artifactId>
+                <version>${redisson.version}</version>
+            </dependency>
+
+            <!-- JWT -->
+            <dependency>
+                <groupId>io.jsonwebtoken</groupId>
+                <artifactId>jjwt-api</artifactId>
+                <version>${jjwt.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.jsonwebtoken</groupId>
+                <artifactId>jjwt-impl</artifactId>
+                <version>${jjwt.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.jsonwebtoken</groupId>
+                <artifactId>jjwt-jackson</artifactId>
+                <version>${jjwt.version}</version>
+            </dependency>
+
+            <!-- OpenAPI 文档 -->
+            <dependency>
+                <groupId>org.springdoc</groupId>
+                <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+                <version>${springdoc.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.springdoc</groupId>
+                <artifactId>springdoc-openapi-starter-webflux-ui</artifactId>
+                <version>${springdoc.version}</version>
+            </dependency>
+
+            <!-- 架构守护测试 -->
+            <dependency>
+                <groupId>com.tngtech.archunit</groupId>
+                <artifactId>archunit-junit5</artifactId>
+                <version>${archunit.version}</version>
+                <scope>test</scope>
+            </dependency>
+
+            <!-- Testcontainers BOM -->
+            <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>testcontainers-bom</artifactId>
+                <version>${testcontainers-bom.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+            <!-- 对象映射 -->
+            <dependency>
+                <groupId>org.mapstruct</groupId>
+                <artifactId>mapstruct</artifactId>
+                <version>${mapstruct.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <!-- JaCoCo 覆盖率插件（对齐规范 11-Testing-Rules K-01） -->
+                <plugin>
+                    <groupId>org.jacoco</groupId>
+                    <artifactId>jacoco-maven-plugin</artifactId>
+                    <version>${jacoco.version}</version>
+                    <configuration>
+                        <skip>${jacoco.skip}</skip>
+                    </configuration>
+                    <executions>
+                        <!-- 测试前注入 agent；destfile 用 late-binding 相对路径（target/jacoco.exec），
+                             避免工作区含非 ASCII 目录时 agent 参数 GBK 乱码导致 exec 静默写不出（评审修复 Major-2） -->
+                        <execution>
+                            <id>prepare-agent</id>
+                            <goals>
+                                <goal>prepare-agent</goal>
+                            </goals>
+                            <configuration>
+                                <destFile>target/jacoco.exec</destFile>
+                            </configuration>
+                        </execution>
+                        <!-- 测试后生成覆盖率报告（dataFile 与 prepare-agent destFile 相对路径对齐） -->
+                        <execution>
+                            <id>report</id>
+                            <phase>test</phase>
+                            <goals>
+                                <goal>report</goal>
+                            </goals>
+                            <configuration>
+                                <dataFile>target/jacoco.exec</dataFile>
+                            </configuration>
+                        </execution>
+                        <!-- 覆盖率门禁：BUNDLE 整体行覆盖率最低 0.60；
+                             service/domain 模块可在各自 pom 中覆盖为 0.80；
+                             haltOnFailure=true：门禁不达标直接失败（评审修复 Major-2，
+                             此前缺省不中断构建导致门禁形同虚设） -->
+                        <execution>
+                            <id>check</id>
+                            <goals>
+                                <goal>check</goal>
+                            </goals>
+                            <configuration>
+                                <dataFile>target/jacoco.exec</dataFile>
+                                <haltOnFailure>true</haltOnFailure>
+                                <rules>
+                                    <rule>
+                                        <element>BUNDLE</element>
+                                        <limits>
+                                            <limit>
+                                                <counter>LINE</counter>
+                                                <value>COVEREDRATIO</value>
+                                                <minimum>0.60</minimum>
+                                            </limit>
+                                        </limits>
+                                    </rule>
+                                </rules>
+                            </configuration>
+                        </execution>
+                    </executions>
+                </plugin>
+                <!-- surefire：argLine 用 @{argLine} late-binding 承接 jacoco prepare-agent
+                     注入的 agent 参数，保证 target/jacoco.exec 真实产出
+                     （评审修复 Major-2：此前未声明导致 agent 未注入、门禁失效） -->
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-surefire-plugin</artifactId>
+                    <configuration>
+                        <argLine>@{argLine}</argLine>
+                    </configuration>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+        <plugins>
+            <!-- 启用 JaCoCo（版本与配置继承自 pluginManagement） -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

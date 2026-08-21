@@ -1,0 +1,25 @@
+# ============================================================
+# runtime-service 私有配置（Nacos dataId: runtime-service.yaml，Group: DEFAULT_GROUP，R-02）。
+# 优先级高于 common.yml（R-04 分层）；敏感值一律 ${ENV} 占位（R-05 零明文）。
+# ============================================================
+
+rocketmq:
+  producer:
+    # 覆盖 common.yml 公共 group：Outbox 中继投递生产者（design/07）
+    group: ${spring.application.name}-pg
+
+doc:
+  outbox:
+    # Outbox 中继调度参数（EV-01/EV-02，design/08 §3.4）
+    poll-interval-ms: ${OUTBOX_POLL_INTERVAL_MS:1000}
+    batch-size: ${OUTBOX_BATCH_SIZE:50}
+    max-retry: ${OUTBOX_MAX_RETRY:16}
+    topic: ${MQ_TOPIC_DOC_EVENT:doc-event}
+  lock:
+    # 状态流转分布式锁参数（lock:doc:{uuid}，G-02：获取失败返回 42901）
+    wait-time-ms: ${DOC_LOCK_WAIT_MS:0}
+    lease-time-ms: ${DOC_LOCK_LEASE_MS:30000}
+  broadcast:
+    # 缓存失效广播消费（BROADCASTING 模式，每节点均消费，design/08 §3.5）
+    topic: ${MQ_TOPIC_CACHE_INVALIDATE:doc-cache-invalidate}
+    group: ${MQ_GROUP_CACHE_INVALIDATE:doc-cache-invalidate-cg}

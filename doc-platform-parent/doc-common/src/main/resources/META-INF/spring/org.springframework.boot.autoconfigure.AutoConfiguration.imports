@@ -1,0 +1,6 @@
+com.example.common.infrastructure.tablestore.config.TablestoreAutoConfiguration
+com.example.common.web.CommonWebAutoConfiguration
+com.example.common.security.RoleCheckAutoConfiguration
+com.example.common.infrastructure.cache.CacheAutoConfiguration
+com.example.common.rule.RuleExecutorAutoConfiguration
+com.example.common.infrastructure.messaging.DocMqAutoConfiguration

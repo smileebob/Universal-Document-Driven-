@@ -1,0 +1,3 @@
+# EnvironmentPostProcessor 注册（Boot 3 该类型仍经 spring.factories 加载）
+org.springframework.boot.env.EnvironmentPostProcessor=\
+  com.example.common.infrastructure.messaging.RocketMqOptionalPostProcessor
