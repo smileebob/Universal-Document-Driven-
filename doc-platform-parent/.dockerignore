@@ -1,4 +1,10 @@
+**/target/
 target/
-.git
-.idea
+**/*.log
+logs/
+*.log
+.git/
+.gitignore
+.qoder/
+.idea/
 *.iml

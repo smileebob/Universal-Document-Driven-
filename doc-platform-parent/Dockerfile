@@ -1,43 +1,35 @@
 # ============================================================
-# 占位模板：镜像 tag 禁 latest，按规范 L-01 验证点补齐。
-# 通用单据驱动平台微服务：通过构建参数 SERVICE 指定服务模块（默认 meta-service）。
-#   docker build --build-arg SERVICE=meta-service -t doc/meta-service:x.y.z .
+# 通用单据驱动平台：按服务构建可运行镜像（构建上下文 = doc-platform-parent）
+#   docker build --build-arg SERVICE=meta-service -t doc/meta-service:1.0.0 .
+# SERVICE 可选：doc-gateway / meta-service / runtime-service
+# 镜像 tag 禁止 latest；生产建议按服务版本或 Git SHA 命名。
+#
+# 注意：本文件已按 Spring Boot 3.5 分层 jar 方式实现，但本机暂无可用 Docker
+# 环境，**未经实际构建验证**；首次使用请在具备 Docker 的机器上构建并冒烟验证。
+# 非容器化部署仍以 deploy/app.sh（开发）或 systemd（生产）为准。
 # ============================================================
 
-# 目标服务模块（doc-gateway / meta-service / runtime-service）
 ARG SERVICE=meta-service
 
 # ---------- 构建阶段 ----------
-FROM eclipse-temurin:17-jdk AS builder
-
+FROM maven:3.9-eclipse-temurin-17 AS builder
+ARG SERVICE=meta-service
 WORKDIR /build
-
-# 占位：复制源码并执行 maven build（请按实际构建方式补齐），例如：
-# COPY . .
-# RUN ./mvnw -B clean package -DskipTests -pl ${SERVICE} -am
+COPY . .
+RUN mvn -B -pl "${SERVICE}" -am clean package -DskipTests \
+    && JAR="$(ls ${SERVICE}/target/${SERVICE}-*.jar | head -n 1)" \
+    && java -Djarmode=tools -jar "${JAR}" extract --layers --launcher --destination /extracted
 
 # ---------- 运行阶段 ----------
 FROM eclipse-temurin:17-jre
-
-WORKDIR /app
-
-# 重新声明 ARG（多阶段构建中运行阶段不可见构建阶段的 ARG）
 ARG SERVICE=meta-service
-
-# 占位：使用 Spring Boot 3.3+ 的 `-Djarmode=tools -jar ${SERVICE}.jar extract --layers --launcher`
-# 解包后进行分层复制（按规范补齐），例如：
-# COPY --from=builder /build/${SERVICE}/target/extracted/dependencies/ ./
-# COPY --from=builder /build/${SERVICE}/target/extracted/snapshot-dependencies/ ./
-# COPY --from=builder /build/${SERVICE}/target/extracted/spring-boot-loader/ ./
-# COPY --from=builder /build/${SERVICE}/target/extracted/launcher/ ./
-# COPY --from=builder /build/${SERVICE}/target/extracted/application/ ./
-
-# 创建非 root 用户并切换
+WORKDIR /app
 RUN groupadd --system app && useradd --system --gid app app
+COPY --from=builder /extracted/dependencies/ ./
+COPY --from=builder /extracted/snapshot-dependencies/ ./
+COPY --from=builder /extracted/spring-boot-loader/ ./
+COPY --from=builder /extracted/launcher/ ./
+COPY --from=builder /extracted/application/ ./
 USER app
-
-# 占位端口：doc-gateway=8080 / meta-service=8081 / runtime-service=8082，按目标服务调整
-EXPOSE 8080
-
-# 占位：按规范补齐启动命令，例如：
-# ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "org.springframework.boot.loader.launch.JarLauncher"]
+EXPOSE 8080 8081 8082
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "org.springframework.boot.loader.launch.JarLauncher"]
