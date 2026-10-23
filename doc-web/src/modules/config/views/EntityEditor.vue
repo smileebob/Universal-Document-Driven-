@@ -6,11 +6,18 @@ import { Modal, message } from 'ant-design-vue';
 import {
   createEntity,
   getEntity,
+  getMenuMount,
   publishEntity,
+  putMenuMount,
   updateEntity,
 } from '@/modules/config/api/schema';
 import type { EntitySavePayload } from '@/modules/config/api/schema';
-import type { AttributeDef, EntityType, MenuMountConfig } from '@/modules/config/types';
+import type { AttributeDef, EntitySchema, EntityType, MenuMountConfig } from '@/modules/config/types';
+import {
+  defaultMenuConfig,
+  fromMenuMountView,
+  toMenuMountPayload,
+} from '@/modules/config/types';
 import AttributeEditDrawer from '@/modules/config/components/AttributeEditDrawer.vue';
 import FormPreviewModal from '@/modules/config/components/FormPreviewModal.vue';
 import MenuMountPanel from '@/modules/config/components/MenuMountPanel.vue';
@@ -23,8 +30,9 @@ const router = useRouter();
 const schemaStore = useSchemaStore();
 const menuStore = useMenuStore();
 
-const code = computed(() => (route.params.code as string) || '');
-const isEdit = computed(() => !!code.value);
+/** 当前编辑编码：创建成功后先回填本值并进入编辑态，再执行菜单挂载 */
+const currentCode = ref((route.params.code as string) || '');
+const isEdit = computed(() => !!currentCode.value);
 const CODE_PATTERN = /^[a-z][a-z0-9_]{1,49}$/;
 
 const basic = reactive({
@@ -34,27 +42,57 @@ const basic = reactive({
   description: '',
 });
 const attributes = ref<AttributeDef[]>([]);
-const menu = ref<MenuMountConfig>({ mounted: false, group_code: 'basic_data', sort_order: 0 });
+const menu = ref<MenuMountConfig>(defaultMenuConfig('basic_data'));
+/** 菜单配置是否已从独立接口加载（新建默认可提交；编辑失败时禁止覆盖远端配置） */
+const menuLoaded = ref(!isEdit.value);
+const menuLoading = ref(false);
+const menuLoadError = ref('');
+/** 定义已保存但菜单挂载失败：仅允许重试挂载，不重复创建/保存 */
+const mountFailed = ref(false);
+const mountErrorText = ref('');
+const retryingMount = ref(false);
 
 const drawerOpen = ref(false);
 const editingAttr = ref<AttributeDef | null>(null);
 const previewOpen = ref(false);
 const saving = ref(false);
 
+function errorText(err: unknown, fallback: string): string {
+  return err instanceof ApiError ? err.message || fallback : fallback;
+}
+
+/** 读取独立菜单挂载配置（含停用配置），用于编辑页回填 */
+async function loadMenu(targetCode: string): Promise<void> {
+  if (!targetCode) return;
+  menuLoading.value = true;
+  menuLoadError.value = '';
+  try {
+    const view = await getMenuMount('entity', targetCode, { silent: true });
+    menu.value = fromMenuMountView(view);
+    menuLoaded.value = true;
+  } catch (err) {
+    menuLoaded.value = false;
+    menuLoadError.value = errorText(err, '菜单挂载配置加载失败');
+  } finally {
+    menuLoading.value = false;
+  }
+}
+
 onMounted(async () => {
   if (!isEdit.value) return;
   try {
-    const schema = await getEntity(code.value);
+    const schema = await getEntity(currentCode.value);
     basic.entity_name = schema.entity_name;
     basic.entity_code = schema.entity_code;
     basic.entity_type = schema.entity_type;
     basic.description = schema.description ?? '';
     attributes.value = schema.attributes;
-    menu.value = schema.menu ?? menu.value;
   } catch {
     message.error('实体定义不存在或已被删除');
     void router.replace('/config/entity');
+    return;
   }
+  await loadMenu(currentCode.value);
 });
 
 // ---------- 属性定义 ----------
@@ -98,29 +136,70 @@ function validateBasic(): string {
 }
 
 function buildPayload(): EntitySavePayload {
+  // 菜单挂载不进入实体保存 DTO，由独立 PUT /schema/entity/{code}/menu 承担
   return {
     entity_name: basic.entity_name.trim(),
     entity_code: basic.entity_code.trim(),
     entity_type: basic.entity_type,
     description: basic.description,
     attributes: attributes.value,
-    menu: menu.value,
   };
 }
 
-/** 写成功后：schema 即时失效 + 菜单失效（design/10 §6.2 ①） */
-function invalidate(): void {
-  schemaStore.invalidate(basic.entity_code);
-  menuStore.invalidate();
+/**
+ * 保存定义（创建/更新）。创建成功后立即更新编辑态并切换到 edit 路由，
+ * 使后续发布/挂载失败后的重试不会重复创建定义。
+ */
+async function persistDefinition(): Promise<string> {
+  if (isEdit.value) {
+    await updateEntity(currentCode.value, buildPayload());
+    return currentCode.value;
+  }
+  const created: EntitySchema = await createEntity(buildPayload());
+  const newCode = created.entity_code || basic.entity_code.trim();
+  currentCode.value = newCode;
+  basic.entity_code = newCode;
+  basic.entity_name = created.entity_name ?? basic.entity_name;
+  basic.entity_type = created.entity_type ?? basic.entity_type;
+  basic.description = created.description ?? basic.description;
+  if (created.attributes?.length) attributes.value = created.attributes;
+  await router.replace({ name: 'config-entity-edit', params: { code: newCode } });
+  return newCode;
 }
 
-async function persist(): Promise<boolean> {
-  if (isEdit.value) {
-    await updateEntity(code.value, buildPayload());
-  } else {
-    await createEntity(buildPayload());
+/** 独立菜单挂载；失败仅标记可重试，不抛回导致“保存失败”的误解 */
+async function mountSaved(targetCode: string): Promise<boolean> {
+  try {
+    await putMenuMount('entity', targetCode, toMenuMountPayload(menu.value, basic.entity_name), {
+      silent: true,
+    });
+    mountFailed.value = false;
+    mountErrorText.value = '';
+    menuStore.invalidate();
+    return true;
+  } catch (err) {
+    mountFailed.value = true;
+    mountErrorText.value = errorText(err, '菜单挂载失败');
+    return false;
   }
-  return true;
+}
+
+async function reloadMenu(): Promise<void> {
+  await loadMenu(currentCode.value);
+  if (menuLoaded.value) message.success('菜单配置已重新加载');
+}
+
+async function retryMount(): Promise<void> {
+  if (!isEdit.value) return;
+  retryingMount.value = true;
+  try {
+    if (!menuLoaded.value) await loadMenu(currentCode.value);
+    if (!menuLoaded.value) return;
+    const ok = await mountSaved(currentCode.value);
+    if (ok) message.success('菜单挂载成功');
+  } finally {
+    retryingMount.value = false;
+  }
 }
 
 async function saveDraft(): Promise<void> {
@@ -130,9 +209,19 @@ async function saveDraft(): Promise<void> {
     return;
   }
   saving.value = true;
+  mountFailed.value = false;
   try {
-    await persist();
-    invalidate();
+    const savedCode = await persistDefinition();
+    schemaStore.invalidate(savedCode);
+    if (!menuLoaded.value) {
+      message.warning('定义已保存；菜单配置未加载，本次未提交菜单变更，请重新加载后重试');
+      return;
+    }
+    const mounted = await mountSaved(savedCode);
+    if (!mounted) {
+      message.error('定义已保存，菜单挂载失败，可重试');
+      return;
+    }
     message.success('操作成功');
     void router.push('/config/entity');
   } finally {
@@ -151,21 +240,36 @@ async function saveAndPublish(): Promise<void> {
     return;
   }
   saving.value = true;
+  mountFailed.value = false;
   try {
-    await persist();
-    await publishEntity(basic.entity_code, { silent: true });
-    invalidate();
+    const savedCode = await persistDefinition();
+    schemaStore.invalidate(savedCode);
+    try {
+      await publishEntity(savedCode, { silent: true });
+    } catch (err) {
+      // 40011：发布校验失败弹出原因清单（prd/07 P-EC-02）
+      if (err instanceof ApiError && err.code === 40011) {
+        const reasons = (err.data as { reasons?: string[] } | undefined)?.reasons;
+        Modal.error({
+          title: '发布校验未通过',
+          content: reasons?.length ? reasons.join('；') : err.message,
+        });
+      } else {
+        message.error(errorText(err, '发布失败'));
+      }
+      return;
+    }
+    if (!menuLoaded.value) {
+      message.warning('定义已保存并发布；菜单配置未加载，本次未提交菜单变更，请重新加载后重试');
+      return;
+    }
+    const mounted = await mountSaved(savedCode);
+    if (!mounted) {
+      message.error('定义已保存，菜单挂载失败，可重试');
+      return;
+    }
     message.success('发布成功');
     void router.push('/config/entity');
-  } catch (err) {
-    // 40011：发布校验失败弹出原因清单（prd/07 P-EC-02）
-    if (err instanceof ApiError && err.code === 40011) {
-      const reasons = (err.data as { reasons?: string[] } | undefined)?.reasons;
-      Modal.error({
-        title: '发布校验未通过',
-        content: reasons?.length ? reasons.join('；') : err.message,
-      });
-    }
   } finally {
     saving.value = false;
   }
@@ -187,7 +291,7 @@ const attrColumns = [
 </script>
 
 <template>
-  <a-card :title="isEdit ? `编辑实体：${code}` : '新建实体'">
+  <a-card :title="isEdit ? `编辑实体：${currentCode}` : '新建实体'">
     <!-- 基础信息区 -->
     <h3 class="mb-3 text-base font-medium">
       基础信息
@@ -287,14 +391,54 @@ const attrColumns = [
       </template>
     </a-table>
 
-    <!-- 菜单挂载区（EC-05） -->
+    <!-- 菜单挂载区（EC-05，独立接口） -->
     <h3 class="mb-3 mt-6 text-base font-medium">
       菜单挂载
     </h3>
+    <a-alert
+      v-if="menuLoadError"
+      type="error"
+      show-icon
+      class="mb-3"
+      message="菜单挂载配置加载失败"
+      :description="`${menuLoadError}；为避免覆盖远端配置，保存时将不会提交菜单变更。`"
+    >
+      <template #action>
+        <a-button
+          size="small"
+          :loading="menuLoading"
+          @click="reloadMenu"
+        >
+          重新加载
+        </a-button>
+      </template>
+    </a-alert>
     <MenuMountPanel
       v-model="menu"
       :default-name="basic.entity_name"
+      :disabled="!menuLoaded"
     />
+
+    <!-- 定义已保存但挂载失败：只重试挂载，不重复创建/保存定义 -->
+    <a-alert
+      v-if="mountFailed"
+      type="error"
+      show-icon
+      class="mt-4"
+      message="定义已保存，菜单挂载失败，可重试"
+      :description="mountErrorText"
+    >
+      <template #action>
+        <a-button
+          size="small"
+          type="primary"
+          :loading="retryingMount"
+          @click="retryMount"
+        >
+          重试挂载
+        </a-button>
+      </template>
+    </a-alert>
 
     <!-- 操作区 -->
     <div class="mt-8 border-t border-gray-100 pt-4">

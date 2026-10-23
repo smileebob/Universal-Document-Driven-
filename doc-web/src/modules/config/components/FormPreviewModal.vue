@@ -42,9 +42,10 @@ function close(): void {
     :footer="null"
     @cancel="close"
   >
+    <!-- 预览与业务表单共用引擎：双向绑定以支持增删行/输入，全程不产生业务写请求 -->
     <DynamicForm
+      v-model="model"
       :attributes="attributes"
-      :model-value="model"
       mode="preview"
     />
     <div class="mt-4 text-right">

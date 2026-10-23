@@ -30,14 +30,15 @@ request.interceptors.request.use(
     if (userStore.token) {
       config.headers.Authorization = `Bearer ${userStore.token}`;
     }
-    // X-User-Id：后端权威操作人（GW-04，缺省 anonymous；流转/数据写操作记录用）
-    if (userStore.username && !config.headers['X-User-Id']) {
-      config.headers['X-User-Id'] = userStore.username;
-    }
-    // X-User-Roles：角色头随请求下发（阶段四步骤 40），服务端 @RequireRoles 校验；
-    // 与网关 AuthGlobalFilter 注入的头同名，dev 关闭认证时外部头原样透传
-    if (userStore.isLoggedIn && !config.headers['X-User-Roles']) {
-      config.headers['X-User-Roles'] = userStore.role;
+    // 演示身份头仅在显式 demo token（mock_ 前缀）下发送：
+    // dev 关闭网关认证时才由网关保留，真实 JWT 模式会被权威 claims 覆盖/忽略。
+    if (userStore.token.startsWith('mock_')) {
+      if (userStore.username && !config.headers['X-User-Id']) {
+        config.headers['X-User-Id'] = userStore.username;
+      }
+      if (!config.headers['X-User-Roles']) {
+        config.headers['X-User-Roles'] = userStore.role;
+      }
     }
     // 写请求自动生成 X-Idempotency-Key（调用方已显式传入时不覆盖）
     const method = (config.method ?? 'get').toLowerCase();
@@ -109,6 +110,8 @@ request.interceptors.response.use(
   },
   (error: AxiosError) => {
     if (error.response?.status === 401) {
+      // 401：清理本地会话（token/角色），再跳登录；403 保持会话并展示无权限
+      useUserStore().logout();
       redirectToLogin();
     }
     return Promise.reject(finishError(normalizeAxiosError(error), error.config));

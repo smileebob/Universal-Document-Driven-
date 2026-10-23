@@ -53,8 +53,16 @@ public class TablestoreUniqueIndexStore implements UniqueIndexStore {
     }
 
     @Override
-    public void release(String targetCode, String attrCode, String value) {
-        template.deleteRow(TABLE, uniquePk(targetCode, attrCode, value));
+    public boolean release(String targetCode, String attrCode, String value, String expectedOwner) {
+        try {
+            template.deleteRow(TABLE, uniquePk(targetCode, attrCode, value),
+                    com.example.common.infrastructure.tablestore.model.RowCondition
+                            .expectExistAndColumnEq("owner_uuid", TsColumnValue.of(expectedOwner)));
+            return true;
+        } catch (TsConditionCheckException e) {
+            // 占位不存在或已切换属主：迟到清理必须放弃，避免误删新 owner
+            return false;
+        }
     }
 
     @Override

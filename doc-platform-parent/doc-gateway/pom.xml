@@ -62,14 +62,12 @@
             <artifactId>sentinel-spring-cloud-gateway-v6x-adapter</artifactId>
         </dependency>
         <!-- Sentinel 规则持久化到 Nacos（规范要求：Nacos 为唯一规则源，控制台仅监控）。
-             默认不激活；接入时取消注释（版本由 SCA BOM 管理），
-             并在 application.yml 中启用 sentinel datasource 配置模板（见注释）。 -->
-        <!--
+             依赖常驻；数据源仅在 prod profile 装配（见 application.yml），
+             确保 dev 不因缺少 Nacos 规则配置而改变启动行为。 -->
         <dependency>
             <groupId>com.alibaba.csp</groupId>
             <artifactId>sentinel-datasource-nacos</artifactId>
         </dependency>
-        -->
 
         <!-- JWT 认证（AuthGlobalFilter 校验令牌并透传 X-User-Id/X-User-Roles，版本由父 POM 锁定） -->
         <dependency>

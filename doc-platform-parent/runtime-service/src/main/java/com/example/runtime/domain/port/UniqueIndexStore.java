@@ -25,13 +25,15 @@ public interface UniqueIndexStore {
     boolean tryReserve(String targetCode, String attrCode, String value, String ownerUuid);
 
     /**
-     * 释放唯一值占位（DeleteRow，仅用于新增回滚与修改换值成功后的旧值释放）。
+     * 条件释放唯一值占位（仅当占位仍属于 expectedOwner 时删除，DATA-02）。
      *
-     * @param targetCode 实体/单据编码
-     * @param attrCode   unique 属性编码
-     * @param value      归一化后的属性值
+     * @param targetCode    实体/单据编码
+     * @param attrCode      unique 属性编码
+     * @param value         归一化后的属性值
+     * @param expectedOwner 期望属主 uuid（防止迟到任务误删新属主占位）
+     * @return true=释放成功；false=占位不存在或已易主（未删除）
      */
-    void release(String targetCode, String attrCode, String value);
+    boolean release(String targetCode, String attrCode, String value, String expectedOwner);
 
     /**
      * 查询唯一值占位行的属主（对账骨架用）。

@@ -15,7 +15,7 @@ import java.lang.annotation.Target;
  * <p>拦截判定由 {@link RoleCheckInterceptor} 执行：
  * 携带角色但均不满足 → HTTP 403；未携带角色头时按
  * {@code doc.auth.role-check.deny-unauthenticated} 开关决定放行/拒绝
- * （dev 网关认证关闭、无角色注入场景默认放行，生产网关开启认证后建议置 true）。</p>
+ * （默认拒绝；仅 dev demo 在外置配置中显式关闭拒绝，生产禁止关闭）。</p>
  */
 @Documented
 @Retention(RetentionPolicy.RUNTIME)

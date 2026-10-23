@@ -102,7 +102,7 @@ public class DataService {
             dataRepository.insert(record);
         } catch (TsConditionCheckException e) {
             // 主行写入失败：回滚唯一占位后按冲突返回
-            uniqueConstraintService.releaseAll(entityCode, reserved);
+            uniqueConstraintService.releaseAll(entityCode, reserved, uuid);
             throw new BizException(ErrorCode.STATUS_CONFLICT, ErrorCode.STATUS_CONFLICT.getDefaultMessage());
         }
         auditService.recordAsync(auditEntry("create", entityCode, uuid, operator, ip, traceId,
@@ -143,11 +143,11 @@ public class DataService {
         boolean ok = dataRepository.updateWithVersion(entityCode, uuid, expectVersion,
                 merged, buildRelations(schema, merged), now);
         if (!ok) {
-            uniqueConstraintService.releaseAll(entityCode, reserved);
+            uniqueConstraintService.releaseAll(entityCode, reserved, uuid);
             throw new BizException(ErrorCode.STATUS_CONFLICT, ErrorCode.STATUS_CONFLICT.getDefaultMessage());
         }
         // 主行 CAS 成功后释放旧值占位（换值流程第三步）
-        uniqueConstraintService.releaseChangedOldValues(schema, existing.getAttributes(), merged);
+        uniqueConstraintService.releaseChangedOldValues(schema, existing.getAttributes(), merged, uuid);
         auditService.recordAsync(auditEntry("update", entityCode, uuid, operator, ip, traceId,
                 toJson(existing.getAttributes()), toJson(merged)));
         return Map.of("uuid", uuid, "version", expectVersion + 1, "status", existing.getStatus());

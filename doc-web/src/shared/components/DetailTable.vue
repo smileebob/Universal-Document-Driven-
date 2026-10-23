@@ -4,7 +4,7 @@
 import { computed, ref } from 'vue';
 import { Modal } from 'ant-design-vue';
 import type { AttributeDef } from '@/modules/config/types';
-import { isEmptyValue } from '@/shared/utils/form';
+import { buildDefaultModel, isEmptyValue } from '@/shared/utils/form';
 import FieldControl from './FieldControl.vue';
 
 const props = withDefaults(
@@ -44,6 +44,12 @@ function findAttr(code: string): AttributeDef | undefined {
   return props.subAttributes.find((a) => a.code === code);
 }
 
+/** 单元格可编辑 = 整表可编辑 且 子字段 editable=true */
+function isCellEditable(code: string): boolean {
+  if (props.readonly) return false;
+  return findAttr(code)?.editable ?? true;
+}
+
 function updateCell(index: number, code: string, value: unknown): void {
   const next = props.modelValue.map((row, i) => (i === index ? { ...row, [code]: value } : row));
   delete cellErrors.value[`${index}:${code}`];
@@ -53,7 +59,8 @@ function updateCell(index: number, code: string, value: unknown): void {
 
 function addRow(): void {
   tableError.value = '';
-  emit('update:modelValue', [...props.modelValue, {}]);
+  // 新行复用默认值引擎：布尔 false / 数字 0 不会被误判为空，default_value 正确回填
+  emit('update:modelValue', [...props.modelValue, buildDefaultModel(props.subAttributes)]);
 }
 
 function removeRow(index: number): void {
@@ -123,7 +130,7 @@ defineExpose({ validate });
           v-else
           :attr="findAttr(column.dataIndex)!"
           :model-value="record[column.dataIndex]"
-          :editable="!readonly"
+          :editable="isCellEditable(column.dataIndex)"
           :error="cellErrors[`${index}:${column.dataIndex}`] ?? ''"
           @update:model-value="updateCell(index, column.dataIndex, $event)"
         />

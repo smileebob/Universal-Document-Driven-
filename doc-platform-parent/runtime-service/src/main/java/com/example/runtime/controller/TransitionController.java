@@ -13,6 +13,8 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.common.exception.BizException;
 import com.example.common.exception.ErrorCode;
 import com.example.common.model.ApiResponse;
+import com.example.common.security.PlatformRoles;
+import com.example.common.security.RequireRoles;
 import com.example.runtime.service.IdempotencyService;
 import com.example.runtime.service.transition.TransitionService;
 
@@ -25,10 +27,13 @@ import io.micrometer.core.instrument.MeterRegistry;
  *
  * <p>幂等（⑦）：X-Idempotency-Key 经 {@link IdempotencyService} 在分布式锁外
  * 占位，重放直接回放首次结果；操作人口径 GW-04（X-User-Id 权威）。
- * 幂等键同时透传流转服务用于 Saga 幂等派生（阶段三）。</p>
+ * 幂等键同时透传流转服务用于 Saga 幂等派生（阶段三）。三类角色均可流转，
+ * 但必须有已认证角色（SEC-01）。</p>
  */
 @RestController
 @RequestMapping("/api/v1/data/doc")
+@RequireRoles({PlatformRoles.PLATFORM_ADMIN, PlatformRoles.BUSINESS_ADMIN,
+        PlatformRoles.BUSINESS_USER})
 public class TransitionController {
 
     private final TransitionService transitionService;

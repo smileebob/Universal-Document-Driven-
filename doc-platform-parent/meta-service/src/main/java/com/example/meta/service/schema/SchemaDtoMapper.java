@@ -55,6 +55,8 @@ public final class SchemaDtoMapper {
             attr.setUnique(def.isUnique());
             attr.setRefEntityCode(def.getRefEntityCode());
             attr.setMaxLength(def.getMaxLength());
+            attr.setPrecision(def.getPrecision());
+            attr.setEditable(def.isEditable());
             attr.setDefaultValue(def.getDefaultValue());
             attr.setDisplayField(def.getDisplayField());
             attr.setSortOrder(def.getListOrder() != null ? def.getListOrder() : order);
@@ -87,7 +89,10 @@ public final class SchemaDtoMapper {
             case "string":
                 return AttributeType.STRING;
             case "integer":
+                return AttributeType.INTEGER;
             case "decimal":
+                return AttributeType.DECIMAL;
+            case "number":
                 return AttributeType.NUMBER;
             case "boolean":
                 return AttributeType.BOOLEAN;

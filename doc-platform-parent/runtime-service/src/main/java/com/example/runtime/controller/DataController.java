@@ -29,7 +29,8 @@ import com.example.runtime.service.IdempotencyService;
  * DELETE 逻辑删；写接口经 {@link IdempotencyService} 承载 X-Idempotency-Key
  * 幂等语义（design/09 §3.2），审计为成功后异步旁路（{@link AuditService}，RD-12）。</p>
  *
- * <p>操作人口径（GW-04）：X-User-Id 为权威值，IP 取 X-Forwarded-For 首段。</p>
+ * <p>操作人口径（GW-04）：X-User-Id 为权威值；来源 IP 优先取网关写入的
+ * X-Real-IP，其次取 X-Forwarded-For 首段（可信边界见 AuthGlobalFilter）。</p>
  */
 @RestController
 @RequestMapping("/api/v1/data")
@@ -62,12 +63,13 @@ public class DataController {
                                       @RequestHeader(value = "X-Idempotency-Key", required = false) String idempotencyKey,
                                       @RequestHeader(value = "X-User-Id", required = false) String userId,
                                       @RequestHeader(value = "X-User-Dept", required = false) String userDept,
+                                      @RequestHeader(value = "X-Real-IP", required = false) String realIp,
                                       @RequestHeader(value = "X-Forwarded-For", required = false) String forwardedFor,
                                       @RequestHeader(value = "X-Trace-Id", required = false) String traceId) {
         Map<String, Object> attributes = attributesOf(body);
         Object result = idempotencyService.execute(idempotencyKey, "POST /api/v1/data/" + entityCode,
                 () -> dataService.create(entityCode, attributes, operator(userId), userDept,
-                        firstIp(forwardedFor), traceId));
+                        clientIp(realIp, forwardedFor), traceId));
         return ApiResponse.ok(result);
     }
 
@@ -78,6 +80,8 @@ public class DataController {
      * @param uuid       数据唯一标识
      * @return 详情投影
      */
+    @RequireRoles({PlatformRoles.PLATFORM_ADMIN, PlatformRoles.BUSINESS_ADMIN,
+            PlatformRoles.BUSINESS_USER})
     @GetMapping("/{entityCode}/{uuid}")
     public ApiResponse<Map<String, Object>> detail(@PathVariable("entityCode") String entityCode,
                                                    @PathVariable("uuid") String uuid) {
@@ -103,6 +107,7 @@ public class DataController {
                                       @RequestBody(required = false) Map<String, Object> body,
                                       @RequestHeader(value = "X-Idempotency-Key", required = false) String idempotencyKey,
                                       @RequestHeader(value = "X-User-Id", required = false) String userId,
+                                      @RequestHeader(value = "X-Real-IP", required = false) String realIp,
                                       @RequestHeader(value = "X-Forwarded-For", required = false) String forwardedFor,
                                       @RequestHeader(value = "X-Trace-Id", required = false) String traceId) {
         Map<String, Object> attributes = attributesOf(body);
@@ -110,7 +115,7 @@ public class DataController {
         Object result = idempotencyService.execute(idempotencyKey,
                 "PUT /api/v1/data/" + entityCode + "/" + uuid,
                 () -> dataService.update(entityCode, uuid, attributes, expectVersion,
-                        operator(userId), firstIp(forwardedFor), traceId));
+                        operator(userId), clientIp(realIp, forwardedFor), traceId));
         return ApiResponse.ok(result);
     }
 
@@ -131,12 +136,14 @@ public class DataController {
                                       @PathVariable("uuid") String uuid,
                                       @RequestHeader(value = "X-Idempotency-Key", required = false) String idempotencyKey,
                                       @RequestHeader(value = "X-User-Id", required = false) String userId,
+                                      @RequestHeader(value = "X-Real-IP", required = false) String realIp,
                                       @RequestHeader(value = "X-Forwarded-For", required = false) String forwardedFor,
                                       @RequestHeader(value = "X-Trace-Id", required = false) String traceId) {
         Object result = idempotencyService.execute(idempotencyKey,
                 "DELETE /api/v1/data/" + entityCode + "/" + uuid,
                 () -> {
-                    dataService.delete(entityCode, uuid, operator(userId), firstIp(forwardedFor), traceId);
+                    dataService.delete(entityCode, uuid, operator(userId),
+                            clientIp(realIp, forwardedFor), traceId);
                     return Map.of("uuid", uuid, "status", 0);
                 });
         return ApiResponse.ok(result);
@@ -174,8 +181,11 @@ public class DataController {
         return userId == null || userId.isBlank() ? "anonymous" : userId;
     }
 
-    /** 来源 IP：X-Forwarded-For 首段 */
-    private String firstIp(String forwardedFor) {
+    /** 来源 IP：网关可信头优先（X-Real-IP），HTTP 头缺失时退回 XFF 首段 */
+    private String clientIp(String realIp, String forwardedFor) {
+        if (realIp != null && !realIp.isBlank()) {
+            return realIp.trim();
+        }
         if (forwardedFor == null || forwardedFor.isBlank()) {
             return null;
         }

@@ -43,6 +43,17 @@ spring:
       # Cloud 2025.0.x 起响应式网关配置迁移至 server.webflux 命名空间（design/09 §2.2）
       server:
         webflux:
+          # CORS 只在网关单点配置（I-07/GW-06）：必须使用 Gateway 绑定的 globalcors 键，
+          # 而非 Spring MVC 的 spring.web.cors（后者在本网关不生效）。
+          # 生产经 CORS_ALLOWED_ORIGIN_PATTERNS 注入具体域名白名单，禁止 "*" + credentials 组合。
+          globalcors:
+            cors-configurations:
+              '[/**]':
+                allowed-origin-patterns: ${CORS_ALLOWED_ORIGIN_PATTERNS:http://localhost:*}
+                allowed-methods: GET,POST,PUT,DELETE,OPTIONS
+                allowed-headers: "*"
+                allow-credentials: true
+                max-age: 3600
           # 路由表（GW-02：语义化路由 id；uri 一律 lb:// 经 Nacos 服务发现 + 负载均衡，GW-03）；
           # 网关不做 StripPrefix（服务内 Controller 映射路径本身含 /api/v1 前缀）；
           # /api/v1/internal/** 不配置任何路由（A-07），外部请求该前缀一律 404，仅内网 Feign 直达
@@ -58,26 +69,23 @@ spring:
   lifecycle:
     # 优雅停机等待时长，须小于部署脚本强杀超时（deploy/app.sh WAIT_TIMEOUT）
     timeout-per-shutdown-phase: 30s
-  # CORS 全局配置（网关统一处理，下游服务不再重复配置）。
-  # 注意：allowed-origins=* 与 allow-credentials=true 是非法组合（Spring 会拒绝），
-  # 故用 allowed-origin-patterns；生产必须收敛为具体域名（经环境变量注入）。
-  web:
-    cors:
-      allowed-origin-patterns: ${CORS_ALLOWED_ORIGIN_PATTERNS:http://localhost:*}
-      allowed-methods: GET,POST,PUT,DELETE,OPTIONS
-      allowed-headers: "*"
-      allow-credentials: true
-      max-age: 3600
 
 # 网关认证配置（AuthGlobalFilter 绑定；放行规则从简、留扩展点）
 doc:
   gateway:
     auth:
       enabled: ${GATEWAY_AUTH_ENABLED:true}
-      # JWT 签名密钥（HS256，生产经环境变量注入，R-05 零明文）
+      # JWT 签名密钥（HS256，生产经环境变量注入，R-05 零明文；prod 要求 ≥32 字节）
       secret: ${GATEWAY_JWT_SECRET:}
       # 放行路径前缀（Ant 风格；健康检查固定放行，扩展点按需追加）
       skip-paths: /actuator/**
+      # 可选归属校验：配置后强制校验（生产建议配置，与签发方一致）
+      issuer: ${GATEWAY_JWT_ISSUER:}
+      audience: ${GATEWAY_JWT_AUDIENCE:}
+      # 可信反向代理/负载均衡地址（精确 IP；仅这些来源允许携带 X-Forwarded-For 链）
+      trusted-proxies: ${GATEWAY_TRUSTED_PROXIES:}
+      # 仅 dev demo：认证关闭时保留前端演示身份头（prod 强制 false）
+      allow-demo-identity-headers: false
 
 management:
   endpoints:
@@ -88,3 +96,39 @@ management:
     health:
       probes:
         enabled: true
+---
+# ============================================================
+# dev profile：本地 demo（无企业身份提供方）。
+# 认证关闭 + 显式允许前端演示身份头，仅用于本机三角色演示；
+# 生产（prod）由 GatewayAuthStartupGuard 强制开启认证并禁止演示身份头。
+# ============================================================
+spring:
+  config:
+    activate:
+      on-profile: dev
+
+doc:
+  gateway:
+    auth:
+      enabled: ${GATEWAY_AUTH_ENABLED:false}
+      allow-demo-identity-headers: true
+---
+# ============================================================
+# prod profile：Sentinel 网关流控规则持久化到 Nacos（唯一规则源）。
+# 控制台仅监控；规则 data-id 由运维在 SENTINEL_GROUP 中维护。
+# ============================================================
+spring:
+  config:
+    activate:
+      on-profile: prod
+  cloud:
+    sentinel:
+      datasource:
+        gw-flow:
+          nacos:
+            server-addr: ${NACOS_SERVER_ADDR}
+            namespace: ${NACOS_NAMESPACE}
+            group-id: SENTINEL_GROUP
+            data-id: ${spring.application.name}-gw-flow-rules
+            data-type: json
+            rule-type: gw-flow

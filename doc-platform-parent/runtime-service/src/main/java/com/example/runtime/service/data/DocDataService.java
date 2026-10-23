@@ -1,9 +1,16 @@
 package com.example.runtime.service.data;
 
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 
 import org.slf4j.Logger;
@@ -17,8 +24,13 @@ import com.example.runtime.domain.model.AuditEntry;
 import com.example.runtime.domain.model.DocDataRecord;
 import com.example.runtime.domain.model.DocDefinition;
 import com.example.runtime.domain.model.DocDefinition.DocAttribute;
+import com.example.runtime.domain.model.FieldError;
+import com.example.runtime.domain.model.UniqueValues;
 import com.example.runtime.domain.port.DocConfigGateway;
 import com.example.runtime.domain.port.DocDataStore;
+import com.example.runtime.domain.port.RefChecker;
+import com.example.runtime.domain.port.UniqueIndexStore;
+import com.example.runtime.domain.validation.DataValidationChain;
 import com.example.runtime.service.AuditService;
 import com.example.runtime.service.rule.DocRuleChecker;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -48,13 +60,22 @@ public class DocDataService {
     private final DocDataStore docDataStore;
     private final DocRuleChecker ruleChecker;
     private final AuditService auditService;
+    private final UniqueIndexStore uniqueIndexStore;
+    private final RefChecker refChecker;
 
     public DocDataService(DocConfigGateway configGateway, DocDataStore docDataStore,
-                          DocRuleChecker ruleChecker, AuditService auditService) {
+                          DocRuleChecker ruleChecker, AuditService auditService,
+                          UniqueIndexStore uniqueIndexStore, RefChecker refChecker) {
         this.configGateway = configGateway;
         this.docDataStore = docDataStore;
         this.ruleChecker = ruleChecker;
         this.auditService = auditService;
+        this.uniqueIndexStore = uniqueIndexStore;
+        this.refChecker = refChecker;
+    }
+
+    /** 已占位的唯一值（创建/换值失败回滚用） */
+    private record ReservedUnique(String attrCode, String value) {
     }
 
     // ==================== 创建（RD-05） ====================
@@ -89,7 +110,14 @@ public class DocDataService {
         DocDataRecord record = new DocDataRecord(uuid, docCode,
                 DocDefinition.INITIAL_STATUS, 1L, attributes, buildDocRelations(definition, attributes), false,
                 operator, dept, now, now);
-        docDataStore.create(record, operator);
+        // 唯一约束占位：规则通过后进入强一致写流程（DATA-01/02）
+        List<ReservedUnique> reserved = reserveUnique(definition, attributes, uuid, null);
+        try {
+            docDataStore.create(record, operator);
+        } catch (RuntimeException e) {
+            releaseUnique(docCode, reserved, uuid);
+            throw e;
+        }
 
         auditService.recordAsync(new AuditEntry(UUID.randomUUID().toString(), "create",
                 TARGET_TYPE_DOC, docCode, uuid, operator, now, null,
@@ -176,21 +204,35 @@ public class DocDataService {
             throw new BizException(ErrorCode.STATE_NOT_EDITABLE,
                     "当前状态不允许修改: " + definition.stateName(record.getCurrentStatus()));
         }
-        validateAttributes(definition, attributes);
+        Map<String, Object> submitted = attributes == null ? Map.of() : attributes;
+        checkUnknownAttributes(definition, submitted);
+        checkFieldEditable(definition, record.getAttributes(), submitted);
+        // 合并语义：未提交属性保留原值；校验基于合并后的完整数据
+        Map<String, Object> merged = new LinkedHashMap<>(record.getAttributes());
+        merged.putAll(submitted);
+        validateAttributes(definition, merged);
 
-        boolean updated = docDataStore.updateEditable(docCode, uuid, expectVersion,
-                record.getCurrentStatus(), attributes, buildDocRelations(definition, attributes),
-                System.currentTimeMillis());
-        if (!updated) {
-            // current_status 快照 CAS 失败：并发流转/修改改变了状态
-            throw new BizException(ErrorCode.STATUS_CONFLICT,
-                    "单据状态已被并发修改，请刷新后重试");
+        List<ReservedUnique> reserved = reserveUnique(definition, merged, uuid, record.getAttributes());
+        boolean updated;
+        try {
+            updated = docDataStore.updateEditable(docCode, uuid, expectVersion,
+                    merged, buildDocRelations(definition, merged),
+                    System.currentTimeMillis());
+        } catch (RuntimeException e) {
+            releaseUnique(docCode, reserved, uuid);
+            throw e;
         }
+        if (!updated) {
+            releaseUnique(docCode, reserved, uuid);
+            throw new BizException(ErrorCode.STATUS_CONFLICT,
+                    "单据已被并发修改，请刷新后重试");
+        }
+        releaseChangedUnique(definition, record.getAttributes(), merged, uuid);
 
         auditService.recordAsync(new AuditEntry(UUID.randomUUID().toString(), "update",
                 TARGET_TYPE_DOC, docCode, uuid, operator, System.currentTimeMillis(),
                 docSnapshot(record.getCurrentStatus(), record.getVersion(), record.getAttributes()),
-                docSnapshot(record.getCurrentStatus(), expectVersion + 1, attributes), null, MDC.get("traceId")));
+                docSnapshot(record.getCurrentStatus(), expectVersion + 1, merged), null, MDC.get("traceId")));
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("uuid", uuid);
         result.put("doc_code", docCode);
@@ -232,19 +274,42 @@ public class DocDataService {
      */
     private void validateAttributes(DocDefinition definition, Map<String, Object> attributes) {
         Map<String, Object> payload = attributes == null ? Map.of() : attributes;
-        for (Map.Entry<String, Object> entry : payload.entrySet()) {
-            if (definition.findAttribute(entry.getKey()) == null) {
-                throw new BizException(ErrorCode.TYPE_INVALID,
-                        "未定义的属性: " + entry.getKey());
-            }
-        }
+        checkUnknownAttributes(definition, payload);
         for (DocAttribute attr : definition.getAttributes()) {
             Object value = payload.get(attr.getCode());
             validateSingle(attr, value, attr.getCode());
         }
     }
 
-    /** 单属性校验（table 型递归明细行） */
+    /** 未定义属性拒绝（头属性与明细行） */
+    private void checkUnknownAttributes(DocDefinition definition, Map<String, Object> attributes) {
+        for (Map.Entry<String, Object> entry : attributes.entrySet()) {
+            if (definition.findAttribute(entry.getKey()) == null) {
+                throw new BizException(ErrorCode.TYPE_INVALID,
+                        "未定义的属性: " + entry.getKey());
+            }
+        }
+    }
+
+    /** editable=false 属性拒绝变更（同值回传视为未变更，40007） */
+    private void checkFieldEditable(DocDefinition definition, Map<String, Object> oldAttributes,
+                                    Map<String, Object> submitted) {
+        List<FieldError> errors = new ArrayList<>();
+        for (DocAttribute attr : definition.getAttributes()) {
+            if (attr.isEditable() || !submitted.containsKey(attr.getCode())) {
+                continue;
+            }
+            if (!sameValue(oldAttributes.get(attr.getCode()), submitted.get(attr.getCode()))) {
+                errors.add(new FieldError(attr.getCode(), attr.getName(),
+                        "「" + attr.getName() + "」不可修改"));
+            }
+        }
+        if (!errors.isEmpty()) {
+            throw DataValidationChain.toException(ErrorCode.NOT_EDITABLE, errors);
+        }
+    }
+
+    /** 单属性校验（table 型递归明细行；类型/长度/精度/引用均在此收口） */
     private void validateSingle(DocAttribute attr, Object value, String path) {
         boolean missing = value == null || (value instanceof String str && str.isBlank());
         if (missing) {
@@ -257,18 +322,107 @@ public class DocDataService {
             validateTable(attr, value, path);
             return;
         }
-        if ("number".equalsIgnoreCase(attr.getDataType()) && !(value instanceof Number)) {
-            throw new BizException(ErrorCode.TYPE_INVALID, "「" + path + "」须为数值");
+        String type = attr.getDataType() == null ? "string"
+                : attr.getDataType().toLowerCase(java.util.Locale.ROOT);
+        switch (type) {
+            case "string" -> {
+                if (!(value instanceof String text)) {
+                    typeError(path, "须为字符串");
+                } else if (attr.getMaxLength() > 0 && text.length() > attr.getMaxLength()) {
+                    typeError(path, "长度超出上限(" + attr.getMaxLength() + ")");
+                }
+            }
+            case "integer" -> {
+                if (!(value instanceof Number) || value instanceof Boolean) {
+                    typeError(path, "须为整数");
+                } else if (decimalOf(value).stripTrailingZeros().scale() > 0) {
+                    typeError(path, "须为整数");
+                }
+            }
+            case "decimal" -> {
+                if (!(value instanceof Number) || value instanceof Boolean) {
+                    typeError(path, "须为数值");
+                } else if (attr.getPrecision() > 0
+                        && decimalOf(value).stripTrailingZeros().scale() > attr.getPrecision()) {
+                    typeError(path, "小数位超出上限(" + attr.getPrecision() + ")");
+                }
+            }
+            case "number" -> {
+                if (!(value instanceof Number) || value instanceof Boolean) {
+                    typeError(path, "须为数值");
+                }
+            }
+            case "boolean" -> {
+                if (!(value instanceof Boolean)) {
+                    typeError(path, "须为布尔值");
+                }
+            }
+            case "date" -> {
+                if (!(value instanceof String text)) {
+                    typeError(path, "须为 yyyy-MM-dd 日期字符串");
+                } else {
+                    try {
+                        LocalDate.parse(text, DateTimeFormatter.ISO_LOCAL_DATE);
+                    } catch (DateTimeParseException e) {
+                        typeError(path, "格式不正确，应为 yyyy-MM-dd");
+                    }
+                }
+            }
+            case "datetime" -> validateDateTime(value, path);
+            case "ref" -> validateRef(attr, value, path);
+            default -> throw new BizException(ErrorCode.TYPE_INVALID,
+                    "「" + path + "」类型不支持: " + attr.getDataType());
         }
-        if ("boolean".equalsIgnoreCase(attr.getDataType()) && !(value instanceof Boolean)) {
-            throw new BizException(ErrorCode.TYPE_INVALID, "「" + path + "」须为布尔值");
+    }
+
+    /** datetime：ISO8601（允许带偏移或本地时间） */
+    private void validateDateTime(Object value, String path) {
+        if (!(value instanceof String text)) {
+            typeError(path, "须为 ISO8601 日期时间字符串");
+            return;
         }
+        try {
+            OffsetDateTime.parse(text, DateTimeFormatter.ISO_DATE_TIME);
+            return;
+        } catch (DateTimeParseException ignored) {
+            // 允许无偏移的本地日期时间
+        }
+        try {
+            LocalDateTime.parse(text, DateTimeFormatter.ISO_DATE_TIME);
+        } catch (DateTimeParseException e) {
+            typeError(path, "格式不正确，应为 ISO8601 日期时间");
+        }
+    }
+
+    /** ref：目标实体数据须存在且未逻辑删除（主键点查，TS-03） */
+    private void validateRef(DocAttribute attr, Object value, String path) {
+        if (!(value instanceof String text) || text.isBlank()) {
+            typeError(path, "须为被引用数据的 uuid");
+            return;
+        }
+        String target = attr.getRefEntityCode();
+        if (target == null || target.isBlank() || !refChecker.isActiveData(target, text)) {
+            throw DataValidationChain.toException(ErrorCode.REF_INVALID, List.of(
+                    new FieldError(path, attr.getName(),
+                            "「" + attr.getName() + "」引用的数据不存在或已停用")));
+        }
+    }
+
+    private void typeError(String path, String reason) {
+        throw new BizException(ErrorCode.TYPE_INVALID, "「" + path + "」" + reason);
+    }
+
+    private static BigDecimal decimalOf(Object value) {
+        return new BigDecimal(value.toString());
     }
 
     /** table 明细校验：行须为 JSON 对象，子属性递归必填/类型校验 */
     private void validateTable(DocAttribute attr, Object value, String path) {
         if (!(value instanceof List<?> rows)) {
             throw new BizException(ErrorCode.TYPE_INVALID, "「" + path + "」须为明细数组");
+        }
+        if (attr.isRequired() && rows.isEmpty()) {
+            throw new BizException(ErrorCode.REQUIRED_MISSING, "「" + path + "」至少需要一行");
         }
         for (int i = 0; i < rows.size(); i++) {
             Object rowObj = rows.get(i);
@@ -288,6 +442,68 @@ public class DocDataService {
                 }
             }
         }
+    }
+
+    /** 唯一约束占位：仅头属性（明细子字段的唯一范围未定义，不在本期承诺） */
+    private List<ReservedUnique> reserveUnique(DocDefinition definition, Map<String, Object> attributes,
+                                               String ownerUuid, Map<String, Object> oldAttributes) {
+        List<ReservedUnique> reserved = new ArrayList<>();
+        for (DocAttribute attr : definition.getAttributes()) {
+            if (!attr.isUnique() || attr.isTable()) {
+                continue;
+            }
+            Object value = attributes.get(attr.getCode());
+            if (value == null) {
+                continue;
+            }
+            if (oldAttributes != null
+                    && sameValue(value, oldAttributes.get(attr.getCode()))) {
+                continue;
+            }
+            String normalized = UniqueValues.normalize(value);
+            if (!uniqueIndexStore.tryReserve(definition.getCode(), attr.getCode(),
+                    normalized, ownerUuid)) {
+                releaseUnique(definition.getCode(), reserved, ownerUuid);
+                throw DataValidationChain.toException(ErrorCode.UNIQUE_CONFLICT, List.of(
+                        new FieldError(attr.getCode(), attr.getName(),
+                                "「" + attr.getName() + "」的值已存在")));
+            }
+            reserved.add(new ReservedUnique(attr.getCode(), normalized));
+        }
+        return reserved;
+    }
+
+    private void releaseUnique(String docCode, List<ReservedUnique> reserved, String ownerUuid) {
+        for (ReservedUnique item : reserved) {
+            uniqueIndexStore.release(docCode, item.attrCode(), item.value(), ownerUuid);
+        }
+    }
+
+    /** 换值成功后释放旧占位（仅当仍属于本数据） */
+    private void releaseChangedUnique(DocDefinition definition, Map<String, Object> oldAttributes,
+                                      Map<String, Object> newAttributes, String ownerUuid) {
+        for (DocAttribute attr : definition.getAttributes()) {
+            if (!attr.isUnique() || attr.isTable()) {
+                continue;
+            }
+            Object oldValue = oldAttributes.get(attr.getCode());
+            if (oldValue == null || sameValue(oldValue, newAttributes.get(attr.getCode()))) {
+                continue;
+            }
+            uniqueIndexStore.release(definition.getCode(), attr.getCode(),
+                    UniqueValues.normalize(oldValue), ownerUuid);
+        }
+    }
+
+    /** 归一化等值比较（NULL 安全；数值同值异构视为相等） */
+    private static boolean sameValue(Object left, Object right) {
+        if (left == null || right == null) {
+            return left == null && right == null;
+        }
+        if (Objects.equals(left, right)) {
+            return true;
+        }
+        return UniqueValues.normalize(left).equals(UniqueValues.normalize(right));
     }
 
     // ==================== RD-09 relations 投影 ====================

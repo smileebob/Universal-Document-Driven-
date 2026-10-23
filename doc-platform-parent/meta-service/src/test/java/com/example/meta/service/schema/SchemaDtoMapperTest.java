@@ -63,8 +63,9 @@ class SchemaDtoMapperTest {
     @DisplayName("mapAttributeType 全分支")
     void mapAttributeType_branches() {
         assertThat(SchemaDtoMapper.mapAttributeType("string")).isEqualTo(AttributeType.STRING);
-        assertThat(SchemaDtoMapper.mapAttributeType("integer")).isEqualTo(AttributeType.NUMBER);
-        assertThat(SchemaDtoMapper.mapAttributeType("decimal")).isEqualTo(AttributeType.NUMBER);
+        assertThat(SchemaDtoMapper.mapAttributeType("integer")).isEqualTo(AttributeType.INTEGER);
+        assertThat(SchemaDtoMapper.mapAttributeType("decimal")).isEqualTo(AttributeType.DECIMAL);
+        assertThat(SchemaDtoMapper.mapAttributeType("number")).isEqualTo(AttributeType.NUMBER);
         assertThat(SchemaDtoMapper.mapAttributeType("boolean")).isEqualTo(AttributeType.BOOLEAN);
         assertThat(SchemaDtoMapper.mapAttributeType("date")).isEqualTo(AttributeType.DATE);
         assertThat(SchemaDtoMapper.mapAttributeType("datetime")).isEqualTo(AttributeType.DATE);

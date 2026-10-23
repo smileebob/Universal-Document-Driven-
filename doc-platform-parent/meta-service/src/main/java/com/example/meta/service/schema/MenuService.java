@@ -25,6 +25,7 @@ import com.example.meta.service.audit.ConfigAuditService;
 import com.example.common.infrastructure.cache.CacheKeyBuilder;
 import com.example.common.infrastructure.cache.CacheService;
 import com.example.meta.web.dto.MenuMountRequest;
+import com.example.meta.web.dto.MenuMountView;
 import com.example.meta.web.dto.MenuMountedView;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -126,6 +127,31 @@ public class MenuService {
         configAuditService.recordConfig("menu_config", targetType + ":" + targetCode,
                 "mount", beforeView, menuSnapshot(entry));
         return entry;
+    }
+
+    /**
+     * 读取单个目标的挂载配置（编辑器回填；未挂载返回 enabled=false 空视图）。
+     *
+     * @param targetType 目标类型（entity/doc）
+     * @param targetCode 目标编码
+     * @return 挂载视图
+     */
+    public MenuMountView getMount(String targetType, String targetCode) {
+        if (!VALID_TARGET_TYPES.contains(targetType)) {
+            throw new BizException(ErrorCode.TYPE_INVALID, "不支持的挂载目标类型: " + targetType);
+        }
+        MenuMountView view = new MenuMountView();
+        view.setTargetType(targetType);
+        view.setTargetCode(targetCode);
+        view.setEnabled(false);
+        menuConfigRepository.findByTarget(targetType, targetCode).ifPresent(entry -> {
+            view.setMenuName(entry.getMenuName());
+            view.setIcon(entry.getIcon());
+            view.setGroupCode(entry.getGroupCode());
+            view.setSortOrder(entry.getSortOrder());
+            view.setEnabled(entry.isEnabled());
+        });
+        return view;
     }
 
     // ==================== EC-05 已挂载视图 ====================

@@ -22,7 +22,7 @@ export interface MockAttribute {
 }
 
 export interface MockMenu {
-  mounted: boolean;
+  enabled: boolean;
   menu_name?: string;
   icon?: string;
   sort_order?: number;
@@ -97,7 +97,7 @@ export const entities = new Map<string, MockEntitySchema>([
       creator: 'mock_admin',
       create_time: now - 86400000 * 3,
       update_time: now - 86400000 * 3,
-      menu: { mounted: true, menu_name: '币种', sort_order: 1, group_code: 'basic_data' },
+      menu: { enabled: true, menu_name: '币种', sort_order: 1, group_code: 'basic_data' },
       attributes: [
         attr({ name: '币种编码', code: 'code', data_type: 'string', required: true, unique: true, max_length: 10, is_list_column: true, is_searchable: true, list_order: 1 }),
         attr({ name: '币种名称', code: 'name', data_type: 'string', required: true, max_length: 50, is_list_column: true, is_searchable: true, list_order: 2 }),
@@ -117,7 +117,7 @@ export const entities = new Map<string, MockEntitySchema>([
       creator: 'mock_admin',
       create_time: now - 86400000 * 3,
       update_time: now - 86400000,
-      menu: { mounted: true, menu_name: '客户', sort_order: 2, group_code: 'basic_data' },
+      menu: { enabled: true, menu_name: '客户', sort_order: 2, group_code: 'basic_data' },
       attributes: [
         attr({ name: '客户名称', code: 'name', data_type: 'string', required: true, max_length: 100, is_list_column: true, is_searchable: true, list_order: 1 }),
         attr({ name: '客户等级', code: 'level', data_type: 'string', max_length: 20, default_value: '普通', is_list_column: true, is_searchable: true, list_order: 2 }),
@@ -139,7 +139,7 @@ export const entities = new Map<string, MockEntitySchema>([
       creator: 'mock_admin',
       create_time: now - 86400000 * 2,
       update_time: now - 86400000 * 2,
-      menu: { mounted: true, menu_name: '产品型号', sort_order: 3, group_code: 'basic_data' },
+      menu: { enabled: true, menu_name: '产品型号', sort_order: 3, group_code: 'basic_data' },
       attributes: [
         attr({ name: '型号', code: 'model_no', data_type: 'string', required: true, unique: true, max_length: 50, is_list_column: true, is_searchable: true, list_order: 1 }),
         attr({ name: '名称', code: 'name', data_type: 'string', required: true, max_length: 100, is_list_column: true, is_searchable: true, list_order: 2 }),
@@ -163,7 +163,7 @@ export const docs = new Map<string, MockDocSchema>([
       creator: 'mock_admin',
       create_time: now - 86400000 * 2,
       update_time: now - 86400000 * 2,
-      menu: { mounted: true, menu_name: '销售订单', sort_order: 1, group_code: 'biz_doc' },
+      menu: { enabled: true, menu_name: '销售订单', sort_order: 1, group_code: 'biz_doc' },
       states: [
         { value: 100, name: '暂存', is_default: true, is_editable: true },
         { value: 10, name: '已提交' },

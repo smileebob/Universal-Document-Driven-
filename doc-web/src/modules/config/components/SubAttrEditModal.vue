@@ -1,8 +1,9 @@
 <script setup lang="ts">
 // SubAttrEditModal：table 属性的子属性编辑弹窗（prd/07 P-DC-02）
-// 子属性类型域为标量子集（不可再为 table/ref，明细行内不支持远程引用选择）
-import { reactive, ref, watch } from 'vue';
-import type { AttributeDef, DataType } from '@/modules/config/types';
+// 支持标量与 ref（引用选择），仅禁止 table 再嵌 table
+import { computed, reactive, ref, watch } from 'vue';
+import { listEntities } from '@/modules/config/api/schema';
+import type { AttributeDef, DataType, EntitySchema } from '@/modules/config/types';
 
 const props = withDefaults(
   defineProps<{
@@ -29,6 +30,7 @@ const SUB_TYPE_OPTIONS: { value: DataType; label: string }[] = [
   { value: 'boolean', label: '布尔 boolean' },
   { value: 'date', label: '日期 date' },
   { value: 'datetime', label: '日期时间 datetime' },
+  { value: 'ref', label: '引用 ref' },
 ];
 
 function emptyForm(): AttributeDef {
@@ -46,13 +48,58 @@ function emptyForm(): AttributeDef {
 
 const form = reactive<AttributeDef>(emptyForm());
 const errorText = ref('');
+const refEntities = ref<EntitySchema[]>([]);
+const refLoading = ref(false);
+
+const displayFieldOptions = computed(() => {
+  const schema = refEntities.value.find((e) => e.entity_code === form.ref_entity_code);
+  return (schema?.attributes ?? [])
+    .filter((a) => a.data_type === 'string')
+    .map((a) => ({ value: a.code, label: `${a.name}(${a.code})` }));
+});
+
+async function ensureRefEntities(): Promise<void> {
+  if (refEntities.value.length > 0) return;
+  refLoading.value = true;
+  try {
+    const res = await listEntities({
+      entity_type: 'base_data',
+      status: 1,
+      offset: 0,
+      limit: 100,
+    });
+    refEntities.value = res.items;
+  } catch {
+    // 加载失败保留空候选，已配置值仍按原值展示
+  } finally {
+    refLoading.value = false;
+  }
+}
+
+function onTypeChange(type: DataType): void {
+  if (type !== 'string') form.max_length = undefined;
+  if (type !== 'decimal') form.precision = undefined;
+  if (type !== 'ref') {
+    form.ref_entity_code = undefined;
+    form.display_field = undefined;
+  } else {
+    void ensureRefEntities();
+  }
+}
+
+function onRefEntityChange(): void {
+  form.display_field = undefined;
+}
 
 watch(
   () => props.open,
-  (open) => {
+  async (open) => {
     if (!open) return;
     Object.assign(form, props.attr ? { ...props.attr } : emptyForm());
+    // 子属性不可再嵌 table，进入弹窗时清空任何历史嵌套
+    form.sub_attributes = undefined;
     errorText.value = '';
+    if (form.data_type === 'ref') await ensureRefEntities();
   },
 );
 
@@ -73,7 +120,11 @@ function save(): void {
     errorText.value = '子属性编码已存在';
     return;
   }
-  emit('save', { ...form });
+  if (form.data_type === 'ref' && !form.ref_entity_code) {
+    errorText.value = '请选择引用实体';
+    return;
+  }
+  emit('save', { ...form, sub_attributes: undefined });
   close();
 }
 </script>
@@ -113,6 +164,7 @@ function save(): void {
         <a-select
           v-model:value="form.data_type"
           :options="SUB_TYPE_OPTIONS"
+          @change="onTypeChange"
         />
       </a-form-item>
       <a-form-item
@@ -136,9 +188,43 @@ function save(): void {
           class="w-full"
         />
       </a-form-item>
-      <a-form-item label="必填">
-        <a-switch v-model:checked="form.required" />
+      <a-form-item
+        v-if="form.data_type === 'ref'"
+        label="引用实体"
+        required
+      >
+        <a-select
+          v-model:value="form.ref_entity_code"
+          :options="refEntities.map((e) => ({ value: e.entity_code, label: e.entity_name }))"
+          :loading="refLoading"
+          show-search
+          option-filter-prop="label"
+          placeholder="选择基础数据实体"
+          @change="onRefEntityChange"
+        />
       </a-form-item>
+      <a-form-item
+        v-if="form.data_type === 'ref'"
+        label="展示属性"
+      >
+        <a-select
+          v-model:value="form.display_field"
+          :options="displayFieldOptions"
+          allow-clear
+          placeholder="默认取第一个字符串列表列"
+        />
+      </a-form-item>
+      <div class="grid grid-cols-3 gap-2">
+        <a-form-item label="必填">
+          <a-switch v-model:checked="form.required" />
+        </a-form-item>
+        <a-form-item label="可见">
+          <a-switch v-model:checked="form.visible" />
+        </a-form-item>
+        <a-form-item label="可编辑">
+          <a-switch v-model:checked="form.editable" />
+        </a-form-item>
+      </div>
       <div
         v-if="errorText"
         class="text-xs text-red-500"

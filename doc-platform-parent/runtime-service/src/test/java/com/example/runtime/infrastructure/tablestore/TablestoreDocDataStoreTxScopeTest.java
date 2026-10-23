@@ -14,6 +14,7 @@ import org.junit.jupiter.api.Test;
 
 import com.example.common.infrastructure.tablestore.LocalTransactionOps;
 import com.example.common.infrastructure.tablestore.bootstrap.TablestoreBootstrap;
+import com.example.common.infrastructure.tablestore.exception.TsConditionCheckException;
 import com.example.common.infrastructure.tablestore.exception.TablestoreAccessException;
 import com.example.common.infrastructure.tablestore.inmemory.InMemoryTablestore;
 import com.example.common.infrastructure.tablestore.model.ColumnUpdate;
@@ -27,6 +28,7 @@ import com.example.runtime.domain.port.DocDataStore.TransitionOutcome;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * OTS 局部事务表级作用域整改验证（TablestoreDocDataStore）。
@@ -86,7 +88,7 @@ class TablestoreDocDataStoreTxScopeTest {
         template.resetTxScope();
 
         TransitionOutcome outcome =
-                store.commitTransition(DOC, uuid, 100L, 10L, "bob", "submit", null);
+                store.commitTransition(DOC, uuid, 1L, 100L, 10L, "bob", "submit", null);
 
         // 事务内触达表集合：只允许 anchor 表 doc_data（含事务内 T1 GetRow 读）
         assertThat(template.touchedTablesInTx()).containsExactly("doc_data");
@@ -101,6 +103,37 @@ class TablestoreDocDataStoreTxScopeTest {
         // 流转审计行落库（audit_log hash4 变体分区键与主行同分区键）
         assertThat(template.getPartitionRange("audit_log",
                 PartitionKeys.dataKey(DOC, uuid))).hasSize(1);
+    }
+
+    // ==================== 版本 CAS（TX-01/TX-02） ====================
+
+    @Test
+    @DisplayName("可编辑修改：同一 version 仅首次提交成功，陈旧快照被拒绝")
+    void updateEditable_staleVersionRejected() {
+        String uuid = UUID.randomUUID().toString();
+        store.create(newRecord(uuid), "alice", null);
+
+        assertThat(store.updateEditable(DOC, uuid, 1L,
+                Map.of("amount", 150), List.of(), System.currentTimeMillis())).isTrue();
+        assertThat(store.updateEditable(DOC, uuid, 1L,
+                Map.of("amount", 999), List.of(), System.currentTimeMillis())).isFalse();
+        assertThat(store.find(DOC, uuid).orElseThrow().getVersion()).isEqualTo(2L);
+        assertThat(store.find(DOC, uuid).orElseThrow().getAttributes()).containsEntry("amount", 150);
+    }
+
+    @Test
+    @DisplayName("流转提交：规则/Saga 使用的旧版本在提交时被拒绝（即使状态未变）")
+    void commitTransition_staleSnapshotRejected() {
+        String uuid = UUID.randomUUID().toString();
+        store.create(newRecord(uuid), "alice", null);
+        // 普通属性修改不改状态，但 version 1 → 2
+        assertThat(store.updateEditable(DOC, uuid, 1L,
+                Map.of("amount", 150), List.of(), System.currentTimeMillis())).isTrue();
+
+        assertThatThrownBy(() -> store.commitTransition(
+                DOC, uuid, 1L, 100L, 10L, "bob", "submit", null))
+                .isInstanceOf(TsConditionCheckException.class);
+        assertThat(store.find(DOC, uuid).orElseThrow().getCurrentStatus()).isEqualTo(100L);
     }
 
     // ==================== 补写失败不阻断 ====================
@@ -131,9 +164,9 @@ class TablestoreDocDataStoreTxScopeTest {
         store.create(newRecord(uuid), "alice", null);
 
         TransitionOutcome first =
-                store.commitTransition(DOC, uuid, 100L, 10L, "bob", "submit", null);
+                store.commitTransition(DOC, uuid, 1L, 100L, 10L, "bob", "submit", null);
         TransitionOutcome second =
-                store.commitTransition(DOC, uuid, 10L, 20L, "bob", "approve", null);
+                store.commitTransition(DOC, uuid, 2L, 10L, 20L, "bob", "approve", null);
 
         // historySeq 与 version 同值：CAS 保护、天然单调唯一
         assertThat(first.version()).isEqualTo(2L);
@@ -169,7 +202,7 @@ class TablestoreDocDataStoreTxScopeTest {
 
         // 主流程正常返回（条件冲突仅 WARN，不阻断；主行已在单表事务内可靠落库）
         TransitionOutcome outcome =
-                store.commitTransition(DOC, uuid, 100L, 10L, "bob", "submit", null);
+                store.commitTransition(DOC, uuid, 1L, 100L, 10L, "bob", "submit", null);
         assertThat(outcome.version()).isEqualTo(2L);
         assertThat(outcome.historySeq()).isEqualTo(2L);
 

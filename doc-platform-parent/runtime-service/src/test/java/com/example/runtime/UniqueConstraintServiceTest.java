@@ -43,8 +43,9 @@ class UniqueConstraintServiceTest {
         }
 
         @Override
-        public void release(String targetCode, String attrCode, String value) {
-            releaseCalls.add(targetCode + "/" + attrCode + "/" + value);
+        public boolean release(String targetCode, String attrCode, String value, String expectedOwner) {
+            releaseCalls.add(targetCode + "/" + attrCode + "/" + value + "/" + expectedOwner);
+            return true;
         }
 
         @Override
@@ -78,7 +79,7 @@ class UniqueConstraintServiceTest {
         assertThat(reserved).isEmpty();
         assertThat(store.reserveCalls).isEmpty();
 
-        service.releaseChangedOldValues(schema, oldAttributes, newAttributes);
+        service.releaseChangedOldValues(schema, oldAttributes, newAttributes, "uuid-1");
         assertThat(store.releaseCalls).isEmpty();
     }
 
@@ -89,7 +90,7 @@ class UniqueConstraintServiceTest {
         Map<String, Object> newAttributes = Map.of("level", 80000.00d);
 
         assertThat(service.reserveChanged(schema, oldAttributes, newAttributes, "uuid-1")).isEmpty();
-        service.releaseChangedOldValues(schema, oldAttributes, newAttributes);
+        service.releaseChangedOldValues(schema, oldAttributes, newAttributes, "uuid-1");
         assertThat(store.releaseCalls).isEmpty();
     }
 
@@ -104,8 +105,8 @@ class UniqueConstraintServiceTest {
         assertThat(reserved).hasSize(1);
         assertThat(store.reserveCalls).containsExactly("customer/level/2");
 
-        service.releaseChangedOldValues(schema, oldAttributes, newAttributes);
-        assertThat(store.releaseCalls).containsExactly("customer/level/1");
+        service.releaseChangedOldValues(schema, oldAttributes, newAttributes, "uuid-1");
+        assertThat(store.releaseCalls).containsExactly("customer/level/1/uuid-1");
     }
 
     @Test

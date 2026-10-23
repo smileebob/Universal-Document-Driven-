@@ -1,4 +1,5 @@
 // 运行时数据接口（prd/11 §2.3：实体 /data/{code}；阶段二单据 /data/doc/{code}）
+import type { AxiosRequestConfig } from 'axios';
 import { del, get, post, put } from '@/shared/api/request';
 import type { ObjType } from '@/modules/config/types';
 import type { DataRecord, SaveDataPayload, StatusHistoryItem, TransitionResult } from '../types';
@@ -33,9 +34,14 @@ export function deleteData(objType: ObjType, code: string, uuid: string): Promis
   return del(`${dataPath(objType, code)}/${uuid}`);
 }
 
-/** 状态历史（RD-08；后端暂无读接口时调用方优雅降级） */
-export function getStatusHistory(objType: ObjType, code: string, uuid: string): Promise<StatusHistoryItem[]> {
-  return get(`${dataPath(objType, code)}/${uuid}/history`);
+/** 状态历史（RD-08；查询失败由页面展示错误与重试，不推断“接口未开放”） */
+export function getStatusHistory(
+  objType: ObjType,
+  code: string,
+  uuid: string,
+  config?: AxiosRequestConfig,
+): Promise<StatusHistoryItem[]> {
+  return get(`${dataPath(objType, code)}/${uuid}/history`, undefined, config);
 }
 
 /**

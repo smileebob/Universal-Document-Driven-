@@ -3,6 +3,7 @@
 // 内存级缓存（刷新页面即失效），故筛选值可原样持有 Dayjs 实例，无需序列化
 import { defineStore } from 'pinia';
 import type { Dayjs } from 'dayjs';
+import type { PaginationCursorState } from '@/shared/composables/usePagination';
 
 export interface ListStateSnapshot {
   filterValues: Record<string, unknown>;
@@ -13,6 +14,8 @@ export interface ListStateSnapshot {
   page: number;
   pageSize: number;
   scrollTop: number;
+  /** 已访问页 token 游标链（详情返回时恢复；缺失/失效则回首页） */
+  cursor?: PaginationCursorState;
 }
 
 export const useListStateStore = defineStore('runtime-list-state', () => {

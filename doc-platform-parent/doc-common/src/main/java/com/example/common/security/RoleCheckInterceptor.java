@@ -16,12 +16,13 @@ import org.springframework.web.servlet.HandlerInterceptor;
 /**
  * 接口级角色校验拦截器（design/11 §六-3 RBAC 简化版：服务 Controller 层落位）。
  *
- * <p>判定顺序：方法级 {@link RequireRoles} 优先于类级；未标注接口一律放行。
- * 角色取自网关注入的 {@code X-User-Roles}（dev 关闭认证时为外部透传值）：</p>
+ * <p>判定顺序：方法级 {@link RequireRoles} 优先于类级；未标注接口放行（业务 Controller
+ * 须显式声明角色要求，公开/技术接口由装配边界隔离）。
+ * 角色取自网关注入的 {@code X-User-Roles}（仅 dev demo 认证关闭时允许外部透传）：</p>
  * <ul>
  *   <li>携带角色且任一命中要求 → 放行；</li>
  *   <li>携带角色但均不满足 → HTTP 403（不泄漏要求明细，H-01）；</li>
- *   <li>未携带角色 → 按 {@code deny-unauthenticated} 开关（dev 默认放行）。</li>
+ *   <li>未携带角色 → 按 {@code deny-unauthenticated} 开关（默认拒绝，仅 dev demo 显式放行）。</li>
  * </ul>
  *
  * <p>403 响应体沿用网关 401 的简单 JSON 形态（{@code {"code":403,...}}）；

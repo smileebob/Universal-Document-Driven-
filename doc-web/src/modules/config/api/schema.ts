@@ -7,7 +7,8 @@ import type {
   DocSchema,
   EntitySchema,
   EntityType,
-  MenuMountConfig,
+  MenuMountPayload,
+  MenuMountView,
   MountedMenuResult,
   ObjType,
   SchemaStatus,
@@ -22,13 +23,13 @@ export interface EntityListParams {
   limit: number;
 }
 
+/** 实体定义保存报文：菜单挂载走独立接口，不混入本 DTO */
 export interface EntitySavePayload {
   entity_name: string;
   entity_code: string;
   entity_type: EntityType;
   description?: string;
   attributes: AttributeDef[];
-  menu?: MenuMountConfig;
 }
 
 /** 写操作响应（后端口径：code/status/version） */
@@ -127,13 +128,22 @@ export function deleteDoc(code: string): Promise<void> {
   return del(`/schema/doc/${code}`);
 }
 
-// ---------- 菜单挂载（EC-05） ----------
+// ---------- 菜单挂载（EC-05，独立于定义保存） ----------
+export function getMenuMount(
+  objType: ObjType,
+  code: string,
+  config?: AxiosRequestConfig,
+): Promise<MenuMountView> {
+  return get(`/schema/${objType}/${code}/menu`, undefined, config);
+}
+
 export function putMenuMount(
   objType: ObjType,
   code: string,
-  config: MenuMountConfig,
+  payload: MenuMountPayload,
+  config?: AxiosRequestConfig,
 ): Promise<void> {
-  return put(`/schema/${objType}/${code}/menu`, config);
+  return put(`/schema/${objType}/${code}/menu`, payload, config);
 }
 
 /** 拉取已挂载菜单（动态菜单 + 全局 schema_version 探针，prd/11 §一） */

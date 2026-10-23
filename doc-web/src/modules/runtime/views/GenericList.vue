@@ -18,6 +18,7 @@ import { usePagination } from '@/shared/composables/usePagination';
 import type { PagingParam } from '@/shared/composables/usePagination';
 import { usePermission } from '@/shared/composables/usePermission';
 import { useSchema } from '@/shared/composables/useSchema';
+import { useMenuStore } from '@/shared/stores/menu';
 import { useSchemaStore } from '@/shared/stores/schema';
 import { formatDecimal, formatTime } from '@/shared/utils/format';
 
@@ -25,6 +26,7 @@ const route = useRoute();
 const router = useRouter();
 const { can } = usePermission();
 const schemaStore = useSchemaStore();
+const menuStore = useMenuStore();
 const listState = useListStateStore();
 const { schema, loading: schemaLoading, loadSchema } = useSchema();
 
@@ -37,8 +39,6 @@ const isDoc = computed(() => objType.value === 'doc');
  * （后端契约值 30；服务端包装两侧通配符后 wildcard 共 32 字符含 *）
  */
 const CONTAINS_MAX_LEN = 30;
-/** offset 分页上限（与 usePagination DEEP_LIMIT 同口径）：恢复页码时钳制，防 token 丢失越界 */
-const OFFSET_LIMIT = 2000;
 
 // ---------- 筛选 ----------
 const filterValues = ref<Record<string, unknown>>({});
@@ -100,9 +100,10 @@ function buildDsl(paging: PagingParam): QueryDsl {
     filters: buildFilters(),
     // 后端 QueryRequest 契约字段为 sorts（复数）
     sorts: [{ field: sortState.value.field, order: sortState.value.order }],
+    // 统一 token 模式：首页不传 token（也不是 offset=0），深页透传上一页游标
     page: paging.token
       ? { token: paging.token, limit: paging.limit }
-      : { offset: paging.offset, limit: paging.limit },
+      : { limit: paging.limit },
     aggregations: isDoc.value
       ? [{ name: 'count_by_status', type: 'group_by', field: 'current_status' }]
       : [],
@@ -123,6 +124,8 @@ const pager = usePagination<DataRecord>(async (paging) => {
 // ---------- 列表态保持（design/10 §6.1：详情返回恢复筛选/分页/滚动） ----------
 /** 待恢复滚动位置（数据加载完成后应用） */
 let pendingScrollTop = 0;
+/** 游标不可恢复时的提示（加载完成后弹出） */
+const restoreNotice = ref('');
 
 function restoreState(): boolean {
   const snap = listState.get(objType.value, code.value);
@@ -134,10 +137,18 @@ function restoreState(): boolean {
     ? [dayjs(snap.createTimeRange[0].valueOf()), dayjs(snap.createTimeRange[1].valueOf())]
     : null;
   sortState.value = { ...snap.sort };
+  // 先清空上一路由/上一查询遗留的游标，防止使用其他实体的 token 跳页
+  pager.reset();
   pager.pageSize.value = snap.pageSize;
-  // 深分页 token 不可跨页恢复：页码钳制在 offset 上限内
-  pager.page.value = Math.min(snap.page, Math.max(1, Math.floor(OFFSET_LIMIT / snap.pageSize)));
-  pendingScrollTop = snap.scrollTop;
+  // token 游标随列表现场缓存保存：可恢复则回到原页，不可恢复明确回首页并提示
+  const cursorRestored = snap.cursor ? pager.restoreCursors(snap.cursor) : false;
+  if (snap.page > 1 && !cursorRestored) {
+    pager.page.value = 1;
+    restoreNotice.value = `原第 ${snap.page} 页的续翻游标已失效，已回到第 1 页，请逐页浏览。`;
+    pendingScrollTop = 0;
+  } else {
+    pendingScrollTop = snap.scrollTop;
+  }
   return true;
 }
 
@@ -151,6 +162,7 @@ onBeforeRouteLeave(() => {
     page: pager.page.value,
     pageSize: pager.pageSize.value,
     scrollTop: document.querySelector('.ant-layout-content')?.scrollTop ?? 0,
+    cursor: pager.exportCursors(),
   });
 });
 
@@ -253,8 +265,25 @@ function removeRow(record: DataRecord): void {
 }
 
 function search(): void {
+  // 筛选/排序变化：游标链失效，从首页重新查询
   pager.reset();
+  statusCounts.value = [];
   void pager.load();
+}
+
+/** 跳页：无目标页游标时钳制到可达页并提示，绝不省略 token 回首页冒充深页 */
+async function handlePageChange(next: number): Promise<void> {
+  try {
+    const result = await pager.goToPage(next);
+    if (!result.clamped) return;
+    message.warning(
+      result.reason === 'last-page'
+        ? `已到末页，无法继续翻到第 ${result.requested} 页`
+        : `第 ${result.requested} 页缺少续翻游标，已停留在第 ${result.page} 页；深分页请使用上一页/下一页逐页浏览。`,
+    );
+  } catch {
+    // 请求层已提示错误；goToPage 已回退原页
+  }
 }
 
 function resetFilters(): void {
@@ -274,36 +303,63 @@ function filterRange(code: string): [Dayjs, Dayjs] | undefined {
   return Array.isArray(v) ? (v as [Dayjs, Dayjs]) : undefined;
 }
 
-function onTableChange(
+async function onTableChange(
   pagination: { current?: number; pageSize?: number },
   _filters: unknown,
   sorter: { field?: string; order?: 'ascend' | 'descend' },
-): void {
-  // 排序变化：默认 create_time 倒序（prd/06 §五）
+): Promise<void> {
+  // 排序变化：清空游标并回到首页（prd/06 §五）
   if (sorter.field) {
     const rawField = String(sorter.field);
     sortState.value = {
       field: rawField === 'create_time' ? 'create_time' : `attributes.${rawField.slice(5)}`,
       order: sorter.order === 'ascend' ? 'asc' : 'desc',
     };
+    search();
+    return;
   }
   if (pagination.pageSize && pagination.pageSize !== pager.pageSize.value) {
-    pager.changePageSize(pagination.pageSize);
-  } else if (pagination.current && pagination.current !== pager.page.value) {
-    pager.changePage(pagination.current);
-  } else {
-    search();
+    await pager.changePageSize(pagination.pageSize);
+    return;
+  }
+  if (pagination.current && pagination.current !== pager.page.value) {
+    await handlePageChange(pagination.current);
   }
 }
 
 async function init(): Promise<void> {
   // 详情返回恢复优先；无缓存则走默认筛选（prd/09 P-RT-05）
   const restored = restoreState();
-  if (!restored) resetFilters();
+  if (!restored) {
+    pager.reset();
+    resetFilters();
+    sortState.value = { field: 'create_time', order: 'desc' };
+    refLabels.value = {};
+    statusCounts.value = [];
+  }
   await loadSchema(objType.value, code.value);
   await pager.load();
+  if (restoreNotice.value) {
+    message.warning(restoreNotice.value);
+    restoreNotice.value = '';
+  }
   applyPendingScroll();
 }
+
+/** 索引/元数据版本变化：旧 token 不再可用，清空游标回首页重查 */
+watch(
+  () => menuStore.schemaVersion,
+  (version, previous) => {
+    if (version === previous) return;
+    void (async () => {
+      pager.reset();
+      statusCounts.value = [];
+      message.warning('索引版本已更新，分页游标已重置，正在重新查询');
+      await loadSchema(objType.value, code.value, true);
+      await pager.load();
+    })();
+  },
+);
 
 onMounted(() => void init());
 watch([objType, code], () => void init());

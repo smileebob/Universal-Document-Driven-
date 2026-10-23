@@ -51,9 +51,14 @@
         <!-- JaCoCo 覆盖率（对齐规范 11-Testing-Rules K-01） -->
         <jacoco.version>0.8.12</jacoco.version>
         <jacoco.skip>false</jacoco.skip>
-        <!-- surefire argLine 空兑底：jacoco prepare-agent 以 late-binding 覆写 @{argLine}；
-             jacoco.skip=true 时该属性保持空串，surefire 仍可解析（评审修复 Major-2） -->
-        <argLine/>
+        <!-- 独立 agent 参数属性（默认空）：prepare-agent 写入该属性，surefire 以
+             @{jacoco.agent.argLine} late-binding 读取；jacoco.skip=true 时保持空串仍可解析。
+             使用独立属性名避免与 surefire 的 argLine 配置互相覆盖。 -->
+        <jacoco.agent.argLine/>
+        <!-- exec 输出到 ASCII 临时目录：Windows 工作区含非 ASCII 路径时，-javaagent 的
+             destfile 经命令行编码可能被破坏并静默不写 exec（本项目路径含中文）。
+             模块级文件名保证互不覆盖，report/check 读取同一绝对路径。 -->
+        <jacoco.exec.file>${java.io.tmpdir}/doc-driven-jacoco-${project.artifactId}.exec</jacoco.exec.file>
     </properties>
 
     <!-- 不设 app-bootstrap 聚合模块：每个域服务均为独立可运行的 Spring Boot 应用 -->
@@ -199,7 +204,8 @@
                                 <goal>prepare-agent</goal>
                             </goals>
                             <configuration>
-                                <destFile>target/jacoco.exec</destFile>
+                                <destFile>${jacoco.exec.file}</destFile>
+                                <propertyName>jacoco.agent.argLine</propertyName>
                             </configuration>
                         </execution>
                         <!-- 测试后生成覆盖率报告（dataFile 与 prepare-agent destFile 相对路径对齐） -->
@@ -210,7 +216,7 @@
                                 <goal>report</goal>
                             </goals>
                             <configuration>
-                                <dataFile>target/jacoco.exec</dataFile>
+                                <dataFile>${jacoco.exec.file}</dataFile>
                             </configuration>
                         </execution>
                         <!-- 覆盖率门禁：BUNDLE 整体行覆盖率最低 0.60；
@@ -223,7 +229,7 @@
                                 <goal>check</goal>
                             </goals>
                             <configuration>
-                                <dataFile>target/jacoco.exec</dataFile>
+                                <dataFile>${jacoco.exec.file}</dataFile>
                                 <haltOnFailure>true</haltOnFailure>
                                 <rules>
                                     <rule>
@@ -241,14 +247,14 @@
                         </execution>
                     </executions>
                 </plugin>
-                <!-- surefire：argLine 用 @{argLine} late-binding 承接 jacoco prepare-agent
-                     注入的 agent 参数，保证 target/jacoco.exec 真实产出
-                     （评审修复 Major-2：此前未声明导致 agent 未注入、门禁失效） -->
+                <!-- surefire：argLine 用 @{jacoco.agent.argLine} late-binding 承接
+                     prepare-agent 注入的 agent 参数，保证 target/jacoco.exec 真实产出；
+                     独立属性避免与 surefire 自身 argLine 冲突。 -->
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-surefire-plugin</artifactId>
                     <configuration>
-                        <argLine>@{argLine}</argLine>
+                        <argLine>@{jacoco.agent.argLine}</argLine>
                     </configuration>
                 </plugin>
             </plugins>

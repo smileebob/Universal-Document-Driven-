@@ -22,6 +22,7 @@ import com.example.runtime.domain.model.EntityDataRecord;
 import com.example.runtime.domain.port.EntityDataRepository;
 import com.example.runtime.infrastructure.reconcile.UniqueOrphanReconcileTask;
 import com.example.runtime.infrastructure.tablestore.TablestoreUniqueIndexStore;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -49,7 +50,8 @@ class UniqueOrphanReconcileTaskTest {
         new TablestoreBootstrap(template).run();
         indexStore = new TablestoreUniqueIndexStore(template);
         entityRepository = mock(EntityDataRepository.class);
-        task = new UniqueOrphanReconcileTask(indexStore, entityRepository, template, false);
+        task = new UniqueOrphanReconcileTask(indexStore, entityRepository, template,
+                new ObjectMapper(), false);
     }
 
     // ==================== 数据播种工具 ====================
@@ -69,11 +71,20 @@ class UniqueOrphanReconcileTaskTest {
 
     /** 播种 entity_data 主行（可控 status / update_time） */
     private void seedEntity(String code, String uuid, long status, long updateTime) {
+        seedEntity(code, uuid, status, updateTime, null);
+    }
+
+    /** 播种 entity_data 主行（可带 attributes JSON，用于换值遗留判定） */
+    private void seedEntity(String code, String uuid, long status, long updateTime,
+                            String attributesJson) {
         Map<String, TsColumnValue> columns = new LinkedHashMap<>();
         columns.put("status", TsColumnValue.of(status));
         columns.put("create_time", TsColumnValue.of(updateTime));
         columns.put("update_time", TsColumnValue.of(updateTime));
         columns.put("version", TsColumnValue.of(1L));
+        if (attributesJson != null) {
+            columns.put("attributes", TsColumnValue.of(attributesJson));
+        }
         template.putRow("entity_data", new TsRow(TsPrimaryKey.builder()
                 .add("partition_key", PartitionKeys.dataKey(code, uuid))
                 .add("uuid", uuid)
@@ -140,8 +151,8 @@ class UniqueOrphanReconcileTaskTest {
     }
 
     @Test
-    @DisplayName("逻辑删 entity（status=0）超 1h 宽限 → 释放")
-    void deletedEntity_beyondGrace_released() {
+    @DisplayName("逻辑删 entity（status=0）无论多久 → 占位保留，唯一值不可复用")
+    void deletedEntity_placeholderKept() {
         long now = System.currentTimeMillis();
         seedUnique("customer", "email", "d@x.com", "owner-2",
                 now - TimeUnit.HOURS.toMillis(3));
@@ -149,12 +160,12 @@ class UniqueOrphanReconcileTaskTest {
 
         Map<String, Object> summary = task.triggerManual();
 
-        assertThat(summary).containsEntry("released", 1L);
-        assertThat(indexStore.findOwner("customer", "email", "d@x.com")).isEmpty();
+        assertThat(summary).containsEntry("skipped_deleted", 1L).containsEntry("released", 0L);
+        assertThat(indexStore.findOwner("customer", "email", "d@x.com")).contains("owner-2");
     }
 
     @Test
-    @DisplayName("逻辑删 entity 宽限内（<1h）→ 跳过保留占位")
+    @DisplayName("逻辑删 entity 宽限内（<1h）→ 同样保留占位")
     void deletedEntity_withinGrace_skipped() {
         long now = System.currentTimeMillis();
         seedUnique("customer", "email", "e@x.com", "owner-3",
@@ -163,13 +174,13 @@ class UniqueOrphanReconcileTaskTest {
 
         Map<String, Object> summary = task.triggerManual();
 
-        assertThat(summary).containsEntry("skipped_fresh", 1L).containsEntry("released", 0L);
+        assertThat(summary).containsEntry("skipped_deleted", 1L).containsEntry("released", 0L);
         assertThat(indexStore.findOwner("customer", "email", "e@x.com")).contains("owner-3");
     }
 
     @Test
-    @DisplayName("doc_data 兜底反查：逻辑删单据超宽限 → 释放")
-    void docRow_deletedBeyondGrace_released() {
+    @DisplayName("doc_data 兜底反查：逻辑删单据 → 占位保留")
+    void docRow_deleted_placeholderKept() {
         long now = System.currentTimeMillis();
         seedUnique("po", "order_no", "PO-2026-001", "doc-1",
                 now - TimeUnit.HOURS.toMillis(3));
@@ -177,12 +188,12 @@ class UniqueOrphanReconcileTaskTest {
 
         Map<String, Object> summary = task.triggerManual();
 
-        assertThat(summary).containsEntry("released", 1L);
-        assertThat(indexStore.findOwner("po", "order_no", "PO-2026-001")).isEmpty();
+        assertThat(summary).containsEntry("skipped_deleted", 1L).containsEntry("released", 0L);
+        assertThat(indexStore.findOwner("po", "order_no", "PO-2026-001")).contains("doc-1");
     }
 
     @Test
-    @DisplayName("doc_data 未删除 → 属主有效跳过")
+    @DisplayName("doc_data 未删除且值未变 → 属主有效跳过")
     void docRow_active_skipped() {
         long now = System.currentTimeMillis();
         seedUnique("po", "order_no", "PO-2026-002", "doc-2",
@@ -192,6 +203,31 @@ class UniqueOrphanReconcileTaskTest {
         Map<String, Object> summary = task.triggerManual();
 
         assertThat(summary).containsEntry("skipped_active", 1L).containsEntry("released", 0L);
+    }
+
+    @Test
+    @DisplayName("有效主行换值后遗留的旧占位 → 释放（owner 条件删除）")
+    void activeEntity_changedValue_oldPlaceholderReleased() {
+        long now = System.currentTimeMillis();
+        seedUnique("customer", "email", "old@x.com", "owner-4",
+                now - TimeUnit.HOURS.toMillis(3));
+        seedEntity("customer", "owner-4", 1L, now, "{\"email\":\"new@x.com\"}");
+
+        Map<String, Object> summary = task.triggerManual();
+
+        assertThat(summary).containsEntry("released", 1L);
+        assertThat(indexStore.findOwner("customer", "email", "old@x.com")).isEmpty();
+    }
+
+    @Test
+    @DisplayName("释放必须比对 owner：旧清理任务不能删除新属主占位")
+    void release_ownerMismatch_doesNotDelete() {
+        seedUnique("customer", "email", "f@x.com", "owner-new", System.currentTimeMillis());
+
+        assertThat(indexStore.release("customer", "email", "f@x.com", "owner-old")).isFalse();
+        assertThat(indexStore.findOwner("customer", "email", "f@x.com")).contains("owner-new");
+        assertThat(indexStore.release("customer", "email", "f@x.com", "owner-new")).isTrue();
+        assertThat(indexStore.findOwner("customer", "email", "f@x.com")).isEmpty();
     }
 
     // ==================== 并发防护 / 单点判定 / 解析 ====================

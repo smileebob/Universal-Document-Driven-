@@ -71,11 +71,11 @@ function isEmpty(v: unknown): boolean {
   return v === undefined || v === null || v === '';
 }
 
-/** 已挂载菜单（实体 + 单据，status=1 且 menu.mounted） */
+/** 已挂载菜单（实体 + 单据，status=1 且 menu.enabled） */
 function mountedMenus(): { items: unknown[]; schema_version: number } {
   const items: unknown[] = [];
   for (const s of entities.values()) {
-    if (s.status === 1 && s.menu?.mounted) {
+    if (s.status === 1 && s.menu?.enabled) {
       items.push({
         code: s.entity_code,
         obj_type: 'entity',
@@ -87,7 +87,7 @@ function mountedMenus(): { items: unknown[]; schema_version: number } {
     }
   }
   for (const s of docs.values()) {
-    if (s.status === 1 && s.menu?.mounted) {
+    if (s.status === 1 && s.menu?.enabled) {
       items.push({
         code: s.doc_code,
         obj_type: 'doc',
@@ -273,15 +273,38 @@ async function dispatch(
     const kind = seg[1]; // entity | doc
     const code = seg[2];
 
-    // PUT /schema/{objType}/{code}/menu
-    if (seg[3] === 'menu' && method === 'PUT' && kind && code) {
+    // GET/PUT /schema/{objType}/{code}/menu（独立挂载接口，snake_case）
+    if (seg[3] === 'menu' && kind && code && (kind === 'entity' || kind === 'doc')) {
       const store = kind === 'doc' ? docs : entities;
       const schema = store.get(code);
       if (!schema) return fail(res, 404, 40401, '定义不存在');
-      schema.menu = (await readBody(req)) as unknown as MockEntitySchema['menu'];
-      schema.update_time = Date.now();
-      bumpSchemaVersion();
-      return ok(res, null);
+      if (method === 'GET') {
+        const menu = schema.menu;
+        return ok(res, {
+          target_type: kind,
+          target_code: code,
+          menu_name: menu?.menu_name ?? null,
+          icon: menu?.icon ?? null,
+          group_code: menu?.group_code ?? null,
+          sort_order: menu?.sort_order ?? 0,
+          enabled: menu?.enabled ?? false,
+        });
+      }
+      if (method === 'PUT') {
+        const body = await readBody(req);
+        const menuName = String(body.menu_name ?? '').trim();
+        if (!menuName) return fail(res, 400, 40001, 'menu_name 不能为空');
+        schema.menu = {
+          enabled: !!body.enabled,
+          menu_name: menuName,
+          icon: body.icon as string | undefined,
+          group_code: body.group_code as string | undefined,
+          sort_order: Number(body.sort_order ?? 0),
+        };
+        schema.update_time = Date.now();
+        bumpSchemaVersion();
+        return ok(res, null);
+      }
     }
 
     if (kind === 'doc') {

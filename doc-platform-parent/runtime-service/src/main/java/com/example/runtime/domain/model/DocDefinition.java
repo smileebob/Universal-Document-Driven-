@@ -98,10 +98,21 @@ public class DocDefinition {
         private final String refEntityCode;
         private final String displayField;
         private final List<DocAttribute> subAttributes;
+        private final boolean editable;
+        private final int precision;
+        private final int maxLength;
 
         public DocAttribute(String code, String name, String dataType, boolean required,
                             boolean unique, String refEntityCode, String displayField,
                             List<DocAttribute> subAttributes) {
+            this(code, name, dataType, required, unique, refEntityCode, displayField,
+                    subAttributes, true, 6, 200);
+        }
+
+        public DocAttribute(String code, String name, String dataType, boolean required,
+                            boolean unique, String refEntityCode, String displayField,
+                            List<DocAttribute> subAttributes, boolean editable,
+                            int precision, int maxLength) {
             this.code = code;
             this.name = name;
             this.dataType = dataType == null ? "string" : dataType;
@@ -110,6 +121,9 @@ public class DocDefinition {
             this.refEntityCode = refEntityCode;
             this.displayField = displayField;
             this.subAttributes = subAttributes == null ? List.of() : List.copyOf(subAttributes);
+            this.editable = editable;
+            this.precision = precision;
+            this.maxLength = maxLength;
         }
 
         public String getCode() {
@@ -142,6 +156,21 @@ public class DocDefinition {
 
         public List<DocAttribute> getSubAttributes() {
             return subAttributes;
+        }
+
+        /** 修改时是否允许变更（40007 守恒字段） */
+        public boolean isEditable() {
+            return editable;
+        }
+
+        /** DECIMAL 小数位上限 */
+        public int getPrecision() {
+            return precision;
+        }
+
+        /** STRING 最大长度 */
+        public int getMaxLength() {
+            return maxLength;
         }
 
         /** 是否明细表格属性（design/02 §四：table 型承载子属性） */

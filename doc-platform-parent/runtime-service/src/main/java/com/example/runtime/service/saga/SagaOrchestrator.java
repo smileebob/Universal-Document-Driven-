@@ -371,6 +371,46 @@ public class SagaOrchestrator {
         throw new SagaDeadException(execution.getSagaId(), compensateError);
     }
 
+    /**
+     * 本地单据提交失败后的同步冲正（TX-03 收口）：正向步骤已全部成功，
+     * 但流转事务因版本/状态冲突或单据删除未能提交。逆序冲正所有已成功步骤，
+     * 使外部副作用与本地状态保持一致；冲正失败转死信。
+     *
+     * @param sagaId Saga 实例 ID
+     * @return 冲正后的终态（COMPENSATED/DEAD）；记录缺失或非 COMPLETED 时返回既有状态
+     */
+    public SagaStatus compensateAfterCommitFailure(String sagaId) {
+        if (sagaId == null || sagaId.isBlank()) {
+            return null;
+        }
+        SagaExecution execution = sagaStore.find(sagaId).orElse(null);
+        if (execution == null) {
+            log.warn("[saga] 提交失败冲正时执行记录缺失: sagaId={}", sagaId);
+            return null;
+        }
+        if (execution.getStatus() != SagaStatus.COMPLETED) {
+            // 已完成冲正/死信，或仍在执行（由恢复任务接手），不重复冲正
+            return execution.getStatus();
+        }
+        TxPlan plan = parsePlan(execution.getTxPlanJson());
+        if (plan == null || plan.steps().isEmpty()) {
+            markDeadManual(execution, "本地提交失败且计划快照缺失，无法冲正");
+            return SagaStatus.DEAD;
+        }
+        List<Map<String, Object>> logs = parseLogs(execution.getStepLogs());
+        long failedSeq = plan.steps().stream()
+                .mapToLong(TxPlan.TxStep::seq).max().orElse(0L) + 1;
+        try {
+            compensate(execution, plan, logs, failedSeq,
+                    "本地单据提交失败，执行外部步骤冲正", System.currentTimeMillis());
+        } catch (SagaCompensatedException e) {
+            return SagaStatus.COMPENSATED;
+        } catch (SagaDeadException e) {
+            return SagaStatus.DEAD;
+        }
+        return execution.getStatus();
+    }
+
     // ==================== 崩溃恢复 ====================
 
     /**

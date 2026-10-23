@@ -368,6 +368,9 @@ public class MetaSchemaGateway implements SchemaGateway, DocConfigGateway {
                 }
             }
         }
+        boolean editable = raw.get("editable") == null || asBool(raw.get("editable"));
+        int precision = raw.get("precision") == null ? 6 : asInt(raw.get("precision"));
+        int maxLength = raw.get("max_length") == null ? 200 : asInt(raw.get("max_length"));
         return new DocDefinition.DocAttribute(
                 String.valueOf(code),
                 raw.get("name") == null ? String.valueOf(code) : String.valueOf(raw.get("name")),
@@ -375,7 +378,7 @@ public class MetaSchemaGateway implements SchemaGateway, DocConfigGateway {
                 asBool(raw.get("required")), asBool(raw.get("unique")),
                 raw.get("ref_entity_code") == null ? null : String.valueOf(raw.get("ref_entity_code")),
                 raw.get("display_field") == null ? null : String.valueOf(raw.get("display_field")),
-                subs);
+                subs, editable, precision, maxLength);
     }
 
     /** StateMachineDTO → DocStateMachine（同 start 合并 end） */
@@ -418,13 +421,15 @@ public class MetaSchemaGateway implements SchemaGateway, DocConfigGateway {
                 continue;
             }
             AttributeType type = adaptType(dto);
+            int precision = type == AttributeType.DECIMAL
+                    ? (dto.getPrecision() == null ? 6 : dto.getPrecision()) : 0;
             defs.add(new AttributeDef(dto.getCode(), dto.getName(), type,
                     dto.isRequired(), dto.isUnique(), dto.getRefEntityCode(),
                     dto.getMaxLength() == null ? 0 : dto.getMaxLength(),
+                    precision,
                     parseDefaultValue(type, dto.getDefaultValue()),
-                    // editable 属配置侧展示字段，不经契约外溢（C-02），取运行域缺省值；
-                    // displayField 为 ref 展示字段（design/02），透传配置侧定义
-                    true, dto.getDisplayField(),
+                    // editable 为运行侧写约束（META-01），由契约透传而非固定 true
+                    dto.isEditable(), dto.getDisplayField(),
                     dto.getSortOrder() == null ? 0 : dto.getSortOrder()));
         }
         defs.sort(Comparator.comparingInt(AttributeDef::getSortOrder));
@@ -439,6 +444,8 @@ public class MetaSchemaGateway implements SchemaGateway, DocConfigGateway {
         }
         return switch (dto.getType()) {
             case STRING -> AttributeType.STRING;
+            case INTEGER -> AttributeType.INTEGER;
+            case DECIMAL -> AttributeType.DECIMAL;
             case NUMBER -> AttributeType.NUMBER;
             case BOOLEAN -> AttributeType.BOOLEAN;
             case DATE -> AttributeType.DATE;
@@ -452,10 +459,30 @@ public class MetaSchemaGateway implements SchemaGateway, DocConfigGateway {
             return null;
         }
         return switch (type) {
+            case INTEGER -> parseInteger(raw);
+            case DECIMAL -> parseDecimal(raw);
             case NUMBER -> parseNumber(raw);
             case BOOLEAN -> Boolean.parseBoolean(raw);
             default -> raw;
         };
+    }
+
+    private Object parseInteger(String raw) {
+        try {
+            return Long.parseLong(raw.trim());
+        } catch (NumberFormatException e) {
+            log.warn("[schema] 默认值非合法整数，按原文透传: {}", raw);
+            return raw;
+        }
+    }
+
+    private Object parseDecimal(String raw) {
+        try {
+            return new java.math.BigDecimal(raw.trim());
+        } catch (NumberFormatException e) {
+            log.warn("[schema] 默认值非合法小数，按原文透传: {}", raw);
+            return raw;
+        }
     }
 
     private Object parseNumber(String raw) {

@@ -16,6 +16,8 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.common.exception.BizException;
 import com.example.common.exception.ErrorCode;
 import com.example.common.model.ApiResponse;
+import com.example.common.security.PlatformRoles;
+import com.example.common.security.RequireRoles;
 import com.example.runtime.service.IdempotencyService;
 import com.example.runtime.service.data.DocDataService;
 
@@ -25,10 +27,13 @@ import com.example.runtime.service.data.DocDataService;
  * <p>路由：POST /api/v1/data/doc/{docCode}（创建）、GET/PUT/DELETE
  * /api/v1/data/doc/{docCode}/{uuid}；写接口经 {@link IdempotencyService}
  * 承载 X-Idempotency-Key；流转入口见 TransitionController。
- * 操作人口径 GW-04：X-User-Id 权威。</p>
+ * 操作人口径 GW-04：X-User-Id 权威。单据写操作按 PRD 权限矩阵对三类角色开放，
+ * 但必须有已认证角色，空角色默认拒绝（SEC-01）。</p>
  */
 @RestController
 @RequestMapping("/api/v1/data/doc")
+@RequireRoles({PlatformRoles.PLATFORM_ADMIN, PlatformRoles.BUSINESS_ADMIN,
+        PlatformRoles.BUSINESS_USER})
 public class DocDataController {
 
     private final DocDataService docDataService;

@@ -8,9 +8,9 @@ import com.fasterxml.jackson.databind.annotation.JsonNaming;
 /**
  * 实体属性定义 DTO（EntitySchemaDTO.attributes 元素，EC 契约固化）。
  *
- * <p>字段为运行侧消费的最小集：code/name/type/required/unique/refEntityCode/
- * maxLength/defaultValue/sortOrder/displayField。配置侧的展示类字段（visible/editable/
- * is_list_column 等）保留在 meta-service 内部存储，不经本契约外溢。</p>
+ * <p>字段为运行侧消费的必要集：code/name/type/required/unique/refEntityCode/
+ * maxLength/precision/editable/defaultValue/sortOrder/displayField。
+ * 其余纯展示字段（visible/is_list_column 等）保留在 meta-service 内部存储。</p>
  */
 @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
 public class AttributeDTO implements Serializable {
@@ -37,6 +37,12 @@ public class AttributeDTO implements Serializable {
 
     /** 最大长度（STRING 类型适用，null 表示不限） */
     private Integer maxLength;
+
+    /** 小数位上限（DECIMAL 类型适用，null 表示按运行侧缺省 6） */
+    private Integer precision;
+
+    /** 是否可修改（运行侧修改接口的写约束，缺省 true） */
+    private boolean editable = true;
 
     /** 默认值（字符串承载，运行侧按 type 解析） */
     private String defaultValue;
@@ -101,6 +107,22 @@ public class AttributeDTO implements Serializable {
 
     public void setMaxLength(Integer maxLength) {
         this.maxLength = maxLength;
+    }
+
+    public Integer getPrecision() {
+        return precision;
+    }
+
+    public void setPrecision(Integer precision) {
+        this.precision = precision;
+    }
+
+    public boolean isEditable() {
+        return editable;
+    }
+
+    public void setEditable(boolean editable) {
+        this.editable = editable;
     }
 
     public String getDefaultValue() {

@@ -39,9 +39,12 @@ export function resolveDeadLetter(
 
 // ---------- Outbox 事件（runtime-service） ----------
 
-/** 滞留/待人工事件列表（send_status=2 或 retry_count>0） */
-export function listRetryableEvents(limit = 50): Promise<RetryEventListResult> {
-  return get('/event/retry', { limit });
+/** 滞留/待人工事件列表（send_status=2 或 retry_count>0；固定上限由页面提示截断） */
+export function listRetryableEvents(
+  limit = 50,
+  config?: AxiosRequestConfig,
+): Promise<RetryEventListResult> {
+  return get('/event/retry', { limit }, config);
 }
 
 /** 手动重发：复位即投；已发送返回 40901 */
@@ -50,6 +53,9 @@ export function resendEvent(eventId: string, config?: AxiosRequestConfig): Promi
 }
 
 /** 消费证据（无真实订阅方时的消费落地证明，Outbox 链路可观测） */
-export function listConsumedEvidences(limit = 20): Promise<ConsumedListResult> {
-  return get('/event/consumed', { limit });
+export function listConsumedEvidences(
+  limit = 20,
+  config?: AxiosRequestConfig,
+): Promise<ConsumedListResult> {
+  return get('/event/consumed', { limit }, config);
 }

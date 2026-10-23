@@ -248,7 +248,10 @@ const subColumns = [
           class="mb-4"
         >
           <template #bodyCell="{ column, record }">
-            <template v-if="column.key === 'required'">
+            <template v-if="column.key === 'data_type'">
+              {{ record.data_type === 'ref' ? `ref → ${record.ref_entity_code ?? '-'}` : record.data_type }}
+            </template>
+            <template v-else-if="column.key === 'required'">
               {{ record.required ? '✔' : '-' }}
             </template>
             <template v-else-if="column.key === 'action'">

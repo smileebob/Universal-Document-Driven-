@@ -143,6 +143,34 @@ class SagaOrchestratorTest {
     }
 
     @Test
+    @DisplayName("本地提交失败后的同步冲正：全部已成功步骤逆序冲正 → COMPENSATED（TX-03 收口）")
+    void compensateAfterCommitFailure_reversesSucceededSteps() {
+        stubEndpoints();
+
+        SagaResult result = orchestrator.execute(plan(), DOC, UUID, 100L, 10L,
+                "alice", "key-commit-fail-1");
+        assertThat(result.status()).isEqualTo(SagaStatus.COMPLETED);
+
+        SagaStatus status = orchestrator.compensateAfterCommitFailure(result.sagaId());
+
+        assertThat(status).isEqualTo(SagaStatus.COMPENSATED);
+        // 逆序：APS（seq2）先于 SAP（seq1）；notify 无冲正端点跳过
+        org.mockito.InOrder inOrder = org.mockito.Mockito.inOrder(stepClient);
+        inOrder.verify(stepClient).post(org.mockito.ArgumentMatchers.eq(APS_COMPENSATE),
+                anyString(), any(TxPlan.TxStep.class), anyString());
+        inOrder.verify(stepClient).post(org.mockito.ArgumentMatchers.eq(SAP_COMPENSATE),
+                anyString(), any(TxPlan.TxStep.class), anyString());
+        assertThat(sagaStore.find(result.sagaId()).orElseThrow().getStatus())
+                .isEqualTo(SagaStatus.COMPENSATED);
+
+        // 幂等：再次调用不重复冲正
+        assertThat(orchestrator.compensateAfterCommitFailure(result.sagaId()))
+                .isEqualTo(SagaStatus.COMPENSATED);
+        verify(stepClient, times(1)).post(org.mockito.ArgumentMatchers.eq(SAP_COMPENSATE),
+                anyString(), any(TxPlan.TxStep.class), anyString());
+    }
+
+    @Test
     @DisplayName("幂等：同幂等键重放命中 EXECUTION 记录，步骤不重复执行（EXPECT_NOT_EXIST）")
     void idempotentReplay_noDoubleExecution() {
         stubEndpoints();

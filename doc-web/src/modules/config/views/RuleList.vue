@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // P-RE-01 规则库列表页（prd/08）：keyword/enabled 筛选 + 启停开关 + 删除（40010 bound_docs）
-// 权限（prd/01 §2.1）：平台管理员可编辑；业务管理员只读访问——
-// 隐藏新增/编辑/删除/启停，保留查看与在线测试（P-RE-03 未限角色，测试不产生数据影响）
+// 权限（prd/01 §2.1）：平台管理员可编辑与测试；业务管理员只读查看
+// 后端规则测试接口 @RequireRoles(PLATFORM_ADMIN)，前端入口同步仅平台管理员可见
 import { computed, onMounted, reactive, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { Modal, message } from 'ant-design-vue';
@@ -14,9 +14,11 @@ import { formatTime } from '@/shared/utils/format';
 import { toUserMessage } from '@/shared/utils/errorMessages';
 
 const router = useRouter();
-const { can } = usePermission();
+const { can, hasRole } = usePermission();
 /** 规则库写权限：无则整页只读呈现（业务管理员，prd/01 §2.1） */
 const canManage = computed(() => can('rule:manage'));
+/** 在线测试入口：与后端一致仅平台管理员 */
+const canTestRule = computed(() => hasRole(['platform_admin']));
 
 const filters = reactive<{ keyword: string; enabled: boolean | '' }>({
   keyword: '',
@@ -35,6 +37,7 @@ const testRuleUuid = ref('');
 const testRuleName = ref('');
 
 function openTest(record: RuleDef): void {
+  if (!canTestRule.value) return;
   testRuleUuid.value = record.rule_uuid;
   testRuleName.value = record.rule_name;
   testOpen.value = true;
@@ -226,8 +229,9 @@ onMounted(() => void load());
           >
             编辑
           </a-button>
-          <!-- 在线测试：P-RE-03 未限角色，只读角色同样可用（不产生数据影响） -->
+          <!-- 在线测试：后端仅平台管理员可调用 -->
           <a-button
+            v-if="canTestRule"
             type="link"
             size="small"
             @click="openTest(record)"

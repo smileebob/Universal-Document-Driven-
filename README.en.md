@@ -4,119 +4,186 @@
 
 ## Positioning
 
-The Universal Document-Driven Platform is an **open-source shared service for documents and orders**, built for business systems in manufacturing and sales — CRM, WMS, ERP, order management, and the like. It lets each business system gain document and order capabilities fast, on top of a **single technical standard** (unified entity/document modeling, state machines, rule engine, and transaction model) — instead of reinventing them one system at a time.
+An **open-source shared service for business documents and orders**, built for CRM, WMS, ERP, order management, and similar systems in manufacturing and sales. It consolidates entity/document modeling, state machines, validation rules, and transaction orchestration into one reusable capability, so each system does not rebuild its own document logic.
 
-The core problems it solves:
+Problems it addresses:
 
-- **Siloed applications**: without a shared standard, every business system rebuilds its own document logic, leading to inconsistent standards, divergent semantics, and painful integration;
-- **Data governance at scale**: document models, state semantics, and data standards are unified globally, so cross-system data stays consistent by design — making aggregation, traceability, and governance dramatically easier down the road.
+- **Siloed applications** — inconsistent document logic, divergent semantics, and costly integration;
+- **Data governance** — one set of document models, lifecycle semantics, and field constraints across systems, making aggregation, traceability, and reconciliation easier.
 
-## Core Capabilities
+**Best fit:** teams building or unifying multiple lifecycle-driven business documents.
+**Not a fit:** file (PDF/Word) management, a complete ERP, a full multi-level approval workflow engine, or a multi-tenant SaaS platform. These are outside the current scope.
 
-- **Metadata-driven entity & document modeling**: field definitions, validation rules, reference relations, and uniqueness constraints — all configured without code, fully driven by metadata;
-- **State machine engine**: document states and transition events, concurrency and consistency control (optimistic concurrency + state transition timeline), visual editing with AntV G6;
-- **Rule engine**: validation and computation rules bound to states and events, executed in a sandboxed SpEL environment;
-- **Transactions & messaging**: Transactional Outbox, Saga orchestration, cache-invalidation broadcasting;
-- **Unified runtime data service**: document create/read, state transitions, and detail timelines all served through one set of runtime APIs;
-- **Operations & monitoring**: health checks, observability endpoints, audit traceability.
+## Design principles
 
-Tech stack: Spring Boot 3.5 / Spring Cloud Alibaba (Nacos / Sentinel / Gateway), Alibaba Cloud Tablestore (with a local simulation mode), Redis, RocketMQ (with a local mock mode), Vue 3 + Vite + Ant Design Vue + AntV G6.
+1. **Metadata is an executable business definition** — fields, types, required/read-only/unique rules, precision, references, states, and validation rules come from configuration; UI rendering and server-side validation share the same definition.
+2. **Configuration and runtime are separate** — `meta-service` manages definitions and publishing, `runtime-service` executes business operations, and `doc-gateway` is the only external entry point.
+3. **A state transition is a business command** — document states can only change through the transition endpoint; ordinary updates cannot bypass the state machine, rules, concurrency control, or history.
+4. **Consistency follows physical boundaries** — primary-key reads are strongly consistent; lists rely on asynchronous indexes; single-partition transactions, Saga compensation, and Outbox events have explicit limits and are not presented as global ACID transactions.
+5. **Contract first, then implementation and verification** — requirements → design → API/storage constraints → staged delivery → contract-level acceptance. AI-assisted development is a delivery method, not a built-in business capability of the platform.
 
-## Module Layout
-
+```text
+Config console ──definitions/publish──▶ meta-service (entities, documents, state machines, rules, tx steps)
+                                             │ invalidation broadcast
+Business UI / external systems ──▶ doc-gateway ──▶ runtime-service (data, transitions, query, events, Saga)
+                                             │
+                                 Tablestore / Redis / RocketMQ
 ```
+
+## Capabilities and boundaries
+
+| Capability | Current implementation | Boundary |
+|---|---|---|
+| Entity/document modeling | Header fields, detail tables, references, unique, required, read-only, length/precision | No formula calculation, auto-assignment, or field linkage |
+| Metadata-driven UI | Lists, forms, details, and state timeline | Specialized interaction pages still require custom code |
+| State machine | Transition configuration, legality checks, concurrency control, state history | Not a general BPM / multi-level approval engine |
+| Validation rules | SpEL expression and HTTP interface rules bound to states/actions | Rules validate only; they do not modify data |
+| Transactions & events | Ordered external steps, reverse compensation, Outbox events, dead-letter handling | Cross-table projections are eventually consistent; production must be exercised with real middleware |
+| Query & audit | Query DSL, pagination/filter/sort, operation audit and state history | Deep pagination is constrained by index semantics; retention policy is deployment-specific |
+| Authorization | Functional roles: platform admin / business admin / business user | No multi-tenancy, organizational isolation, or field-level permissions in this phase |
+
+## End-to-end flow
+
+1. An administrator defines and publishes base entities (products, customers, etc.).
+2. Define document headers, details and states; configure the state machine, validation rules and optional external steps.
+3. Publish the definition and mount it as a menu.
+4. Business users create documents and perform transitions (submit/review/release).
+5. Transitions run validation, concurrency control, external steps and event publishing; results are traceable from detail, history and operations pages.
+
+## Tech stack
+
+Java 17 / Spring Boot 3.5 / Spring Cloud Alibaba 2025 (Nacos, Sentinel, Gateway) / Alibaba Cloud Tablestore (local simulation supported) / Redis / RocketMQ (local mock supported) / Vue 3 + Vite + Ant Design Vue + AntV G6.
+
+## Module layout
+
+```text
 Document-Driven/
-├── doc-platform-parent/        # Backend (Maven multi-module aggregator)
-│   ├── doc-gateway/            # API gateway (routing, JWT auth, rate limiting)
-│   ├── meta-service/           # Metadata service (entity/document definitions, state machines, rule config)
-│   ├── runtime-service/        # Runtime service (document data, state transitions, transactions)
-│   ├── meta-service-api/       # meta-service external contracts (Feign/DTO)
-│   ├── runtime-service-api/    # runtime-service external contracts (Feign/DTO)
-│   ├── doc-common/             # Shared library (Tablestore anti-corruption layer, caching, messaging facade, domain basics)
-│   ├── deploy/                 # Deployment scripts (app.sh: start/stop/status/restart)
-│   └── docs/                   # Engineering docs (including the pre-commit review checklist)
-└── doc-web/                    # Frontend (Vue 3 + Vite: config console + runtime pages + ops monitoring)
+├── doc-platform-parent/          # Backend (Maven aggregator)
+│   ├── doc-gateway/              # Gateway: routing, JWT auth, rate limiting, CORS
+│   ├── meta-service/             # Configuration domain: definitions, publishing, menus, cache invalidation
+│   ├── runtime-service/          # Runtime domain: data, transitions, query, events, Saga, operations
+│   ├── meta-service-api/         # Configuration-domain Feign contracts and DTOs
+│   ├── runtime-service-api/      # Runtime-domain Feign contracts and DTOs
+│   ├── doc-common/               # Storage/cache/messaging anti-corruption layer, errors, security components
+│   ├── deploy/                   # Development/integration deployment script
+│   └── docs/                     # Commit checklist, OpenAPI snapshots, performance baseline, alert rules
+└── doc-web/                      # Vue 3 frontend (config console, runtime pages, operations)
 ```
 
-## Quick Start
+## Quick start
 
-### Run Locally with Zero Cloud Resources (dev profile + simulation mode)
+### Prerequisites
 
-The backend supports a **zero-cloud-dependency** launch: under the dev profile, Tablestore defaults to the in-memory simulation mode (`OTS_MODE=simulation`) and messaging defaults to the mock mode (`DOC_MQ_MODE=mock`) — the full flow runs locally with no Alibaba Cloud resources at all.
+| Dependency | Requirement | Notes |
+|---|---|---|
+| JDK / Maven | JDK 17+, Maven 3.8+ | Backend build |
+| Node.js / npm | Node 20+ | Frontend build |
+| Nacos | A local standalone instance is sufficient | Required for gateway/service discovery |
+| Redis | A local standalone instance is sufficient | Locks, cache, and mock-message bridge |
+
+**"Zero cloud resources" does not mean "zero local middleware":** under the dev profile Tablestore runs in memory simulation and RocketMQ runs as an in-process mock, but Nacos and Redis must still be available locally (defaults `127.0.0.1:8848` / `127.0.0.1:6379`). Simulated data is lost on restart; mock messaging does not prove real broker delivery semantics.
+
+### 1. Build the backend
 
 ```bash
-# 1. Build (inside doc-platform-parent)
+cd doc-platform-parent
 mvn clean package -DskipTests
+```
 
-# 2. Start the three services in order (ports 8080/8081/8082)
-java -jar doc-gateway/target/doc-gateway-*.jar         # Gateway :8080
-java -jar meta-service/target/meta-service-*.jar       # Metadata service :8081
-java -jar runtime-service/target/runtime-service-*.jar # Runtime service :8082
+### 2. Start the three services (one terminal each, dev profile)
 
-# 3. Start the frontend (port 5173)
-cd doc-web
+```bash
+export SPRING_PROFILES_ACTIVE=dev
+export OTS_MODE=simulation
+export DOC_MQ_MODE=mock
+```
+
+```bash
+# Terminal A: gateway (:8080; dev profile disables auth for local demo)
+java -jar doc-gateway/target/doc-gateway-*.jar
+
+# Terminal B: configuration service (:8081)
+java -jar meta-service/target/meta-service-*.jar
+
+# Terminal C: runtime service (:8082)
+java -jar runtime-service/target/runtime-service-*.jar
+```
+
+PowerShell: `$env:SPRING_PROFILES_ACTIVE="dev"; $env:OTS_MODE="simulation"; $env:DOC_MQ_MODE="mock"`.
+
+A service is considered started only when the log has no sustained errors and `curl http://localhost:8080/actuator/health` (and the same for `:8081`/`:8082`) returns `UP`. The first administrator definition must be created via the API or UI; the project does not ship reusable production accounts.
+
+### 3. Start the frontend
+
+```bash
+cd doc-web        # from the repository root
 npm install
 npm run dev
 ```
 
-> Note: under the dev profile, if no local Nacos/Redis is present, the corresponding components degrade gracefully to the placeholder defaults in application.yml. To connect real Nacos/Redis/Tablestore/RocketMQ, just inject the values via environment variables (see below).
+Open `http://localhost:5173`. Local login is a **demo login** (role selection is allowed for development only and does not represent the real permission model). Production must integrate a real identity provider and enable gateway authentication.
 
-### Sensitive Configuration Is Always Injected via Environment Variables
+### 4. Stop
 
-This project follows a **zero-plaintext-secrets** policy: keys, endpoints, and credentials are never written into code or config files. They are injected exclusively through environment variables (application.yml references them as `${ENV:default}` placeholders, falling back to dev-only local defaults when unset).
+For development: `cd doc-platform-parent && ./deploy/app.sh stop doc-gateway` (development script only; production should use systemd or a container orchestrator with health probes).
 
-## Environment Variables
+## Environment variables
 
-| Variable | Description |
-| --- | --- |
-| `NACOS_SERVER_ADDR` | Nacos registry/config-center address |
-| `NACOS_NAMESPACE` | Nacos namespace |
-| `REDIS_HOST` / `REDIS_PORT` | Redis host and port |
-| `REDIS_USERNAME` / `REDIS_PASSWORD` | Redis ACL credentials |
-| `REDIS_TIMEOUT_MS` / `REDIS_CONNECT_TIMEOUT_MS` | Redis timeout parameters |
-| `OTS_MODE` | Tablestore assembly mode: `ots` (real instance, default) / `simulation` (in-memory, dev/test only) |
-| `OTS_ENDPOINT` / `OTS_INSTANCE` | Tablestore endpoint and instance name |
-| `OTS_ACCESS_KEY_ID` / `OTS_ACCESS_KEY_SECRET` | Tablestore access keys |
-| `OTS_AUTO_CREATE` | Auto-create tables on startup (dev/test only; disabled in production) |
-| `DOC_MQ_MODE` | Messaging facade mode: `mock` (default, in-process simulation + Redis Pub/Sub bridge) / `rocketmq` (real RocketMQ) |
-| `ROCKETMQ_ENDPOINT` | RocketMQ endpoint (name-server semantics) |
-| `ROCKETMQ_ACCESS_KEY` / `ROCKETMQ_SECRET_KEY` | RocketMQ access keys |
-| `GATEWAY_JWT_SECRET` | Gateway JWT signing secret (HS256) |
-| `GATEWAY_AUTH_ENABLED` | Gateway authentication switch |
+### Required for development
 
-> The authoritative list and injection methods (export / `/etc/environment` / systemd EnvironmentFile) are documented in the "Environment Variable Injection" section of [`doc-platform-parent/deploy/app.sh`](doc-platform-parent/deploy/app.sh).
+| Variable | Local default | Purpose |
+|---|---|---|
+| `NACOS_SERVER_ADDR` / `NACOS_NAMESPACE` | `127.0.0.1:8848` / empty | Registry and configuration center |
+| `REDIS_HOST` / `REDIS_PORT` | `127.0.0.1` / `6379` | Cache, locks, mock bridge |
+| `REDIS_USERNAME` / `REDIS_PASSWORD` | empty | Redis ACL credentials (mandatory in production) |
+| `OTS_MODE` | `simulation` under dev | `simulation` (dev/test only) or `ots` |
+| `DOC_MQ_MODE` | `mock` | `mock` (dev/test only) or `rocketmq` |
+| `SERVER_PORT` | 8080/8081/8082 | Per-service port override |
 
-### Runtime Tuning Variables (Optional, All with Defaults)
+### Production / real middleware
 
-The following variables are for production tuning; when unset, they fall back to the defaults in the config files:
+| Variable | Purpose |
+|---|---|
+| `OTS_ENDPOINT` / `OTS_INSTANCE` | Tablestore endpoint and instance |
+| `OTS_ACCESS_KEY_ID` / `OTS_ACCESS_KEY_SECRET` | Tablestore credentials |
+| `OTS_AUTO_CREATE` | Startup table creation (must be false in production) |
+| `ROCKETMQ_ENDPOINT` / `ROCKETMQ_ACCESS_KEY` / `ROCKETMQ_SECRET_KEY` | RocketMQ connection settings |
+| `GATEWAY_JWT_SECRET` | JWT signing secret (HS256; at least 32 bytes in production) |
+| `GATEWAY_JWT_ISSUER` / `GATEWAY_JWT_AUDIENCE` | Optional strict validation; mismatching tokens are rejected |
+| `GATEWAY_TRUSTED_PROXIES` | Trusted reverse proxies (comma-separated; only their XFF is honored) |
+| `GATEWAY_AUTH_ENABLED` | Must be true in production; false by default under dev |
+| `CORS_ALLOWED_ORIGIN_PATTERNS` | Gateway origin allowlist (never `*` with credentials) |
+| `SENTINEL_DASHBOARD` | Sentinel console (monitoring only; rules are governed via Nacos) |
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `OUTBOX_POLL_INTERVAL_MS` | `1000` | Outbox relay polling interval (ms) |
-| `OUTBOX_BATCH_SIZE` | `50` | Outbox relay batch size |
-| `OUTBOX_MAX_RETRY` | `16` | Max retries for Outbox messages |
-| `DOC_CACHE_L1_TTL_MINUTES` | `60` | Document-definition L1 (Redis) cache TTL (minutes) |
-| `DOC_CACHE_L2_TTL_MINUTES` | `5` | Document-definition L2 (local Caffeine) cache TTL (minutes) |
-| `DOC_CACHE_WARMUP_ENABLED` | `true` | Cache warm-up on startup |
-| `DOC_LOCK_WAIT_MS` | `0` | Distributed-lock acquisition wait time for state transitions (ms) |
-| `DOC_LOCK_LEASE_MS` | `30000` | Distributed-lock lease duration for state transitions (ms) |
-| `MQ_TOPIC_DOC_EVENT` | `doc-event` | Topic for document events delivered by the Outbox |
-| `MQ_TOPIC_CACHE_INVALIDATE` | `doc-cache-invalidate` | Topic for cache-invalidation broadcasts |
-| `MQ_GROUP_CACHE_INVALIDATE` | `doc-cache-invalidate-cg` | Consumer group for cache-invalidation broadcasts |
-| `SCHEMA_CACHE_TTL_SECONDS` | `300` | meta-service schema cache TTL (seconds; TTL fallback for broadcast invalidation) |
-| `RECONCILE_UNIQUE_ORPHAN` | `false` | Scheduled reconciliation of uniqueness-constraint orphan records (the manual trigger endpoint is unaffected by this switch) |
-| `DOC_SCHEMA_INVALIDATION_MQ` | `true` | MQ broadcast switch for schema invalidation (falls back to Caffeine TTL when off) |
+### Tuning (optional, defaults provided)
+
+`DOC_CACHE_L1_TTL_MINUTES` (60), `DOC_CACHE_L2_TTL_MINUTES` (5), `DOC_CACHE_WARMUP_ENABLED` (true), `DOC_SCHEMA_INVALIDATION_MQ` (true), `RECONCILE_UNIQUE_ORPHAN` (false), `REDIS_TIMEOUT_MS` (2000ms), `REDIS_CONNECT_TIMEOUT_MS` (2000ms).
+
+> Production startup guards: under the prod profile, simulation storage, mock messaging, and startup auto-create are rejected; the gateway must enable authentication with a strong secret. Misconfiguration fails fast instead of silently degrading.
+
+## Known limitations and verification status
+
+- The rule engine validates only; there is no amount calculation, assignment, or field linkage. `unique` currently applies to document header fields only; uniqueness of detail sub-fields is not defined;
+- State history, events and audit are written as post-commit projections with retries, i.e. eventually consistent. **Extreme post-commit write failures rely on alerts and manual reconciliation**; high-reliability deployments must rehearse recovery/reconciliation before go-live;
+- Publishing a new searchable field triggers a search-index rebuild, during which list queries may be briefly unavailable. Production should use a renamed candidate index → switch → retire the old index; the code documents this path but does not automate it;
+- Multidimensional indexes are built asynchronously: newly written rows may briefly be invisible to list filters, while detail reads by primary key are unaffected;
+- Multi-tenancy, complex approval, print templates, and bulk Excel import/export are out of scope;
+- The [performance baseline](doc-platform-parent/docs/perf-report.md) comes from a local simulation environment and **does not represent production capacity**; re-test with real OTS/RocketMQ/Redis;
+- The current code changes pass the related backend unit/API tests; browser and real-cloud acceptance still need to be executed in the target environment.
+
+## API and development documents
+
+- [Pre-commit review checklist](doc-platform-parent/docs/commit-review-checklist.md)
+- [OpenAPI snapshots](doc-platform-parent/docs/openapi/)
+- [Alert rules](doc-platform-parent/docs/alert-rules.md)
+- [Simulation performance report](doc-platform-parent/docs/perf-report.md)
 
 ## Contributing
 
-Issues and pull requests are welcome. Please note:
-
-- **Every commit must first pass the pre-commit review checklist defined in [`doc-platform-parent/docs/commit-review-checklist.md`](doc-platform-parent/docs/commit-review-checklist.md)** (blacklisted-path check, zero-tolerance sensitive-string scan, repo-size spot check). Commits that fail the checklist are rejected outright;
-- The backend follows Spring Cloud Alibaba conventions and the frontend follows Vue conventions — see the in-repo documentation for details;
-- Commit messages should clearly describe the motivation and impact of the change.
+Issues and pull requests are welcome. Every commit must pass the [pre-commit review checklist](doc-platform-parent/docs/commit-review-checklist.md) (blacklisted paths, zero-tolerance secret scan, repository-size check). The backend follows Spring Cloud Alibaba conventions and the frontend follows Vue conventions.
 
 ## License
 
-This project is licensed under **GPL-3.0-or-later** (GNU General Public License v3.0 or later). The full license text is available in [LICENSE](LICENSE).
+Licensed under **GPL-3.0-or-later**. See [LICENSE](LICENSE).
 
 Copyright © 2026 Document-Driven Platform contributors.

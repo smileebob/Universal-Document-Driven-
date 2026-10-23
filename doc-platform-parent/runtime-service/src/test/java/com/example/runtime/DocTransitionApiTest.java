@@ -96,6 +96,7 @@ class DocTransitionApiTest {
     private RuleExecutor ruleExecutor;
     private MockMvc mockMvc;
     private FakeDocConfigGateway configGateway;
+    private com.example.runtime.infrastructure.tablestore.TablestoreEntityDataRepository entityRepository;
 
     @BeforeEach
     void setUp() {
@@ -140,8 +141,12 @@ class DocTransitionApiTest {
         TransitionService transitionService = new TransitionService(
                 redissonClient, configGateway, docDataStore, ruleChecker, auditService,
                 mock(SagaOrchestrator.class), mock(OutboxRelayService.class));
+        entityRepository = new com.example.runtime.infrastructure.tablestore
+                .TablestoreEntityDataRepository(template, mapper);
         DocDataService docDataService = new DocDataService(
-                configGateway, docDataStore, ruleChecker, auditService);
+                configGateway, docDataStore, ruleChecker, auditService,
+                new com.example.runtime.infrastructure.tablestore.TablestoreUniqueIndexStore(template),
+                entityRepository);
         IdempotencyService idempotencyService =
                 new IdempotencyService(new TablestoreIdempotencyStore(template), mapper);
 
@@ -351,10 +356,11 @@ class DocTransitionApiTest {
     @DisplayName("模拟锁失效双写：过期 fromStatus 提交被 CAS 拦截，无重复历史（design/05 §四 3.1/3.5）")
     void staleDoubleWrite_casRejects() throws Exception {
         String uuid = createPo(100);
-        // 正常流转一次：100 → 10
-        docDataStore.commitTransition(DOC, uuid, 100L, 10L, "alice", "submit", null);
-        // 模拟锁失效后的迟到双写：仍以旧状态 100 发起 → 条件更新失败
-        assertThatThrownBy(() -> docDataStore.commitTransition(DOC, uuid, 100L, 10L, "bob", "submit", null))
+        // 正常流转一次：100 → 10（初始 version=1）
+        docDataStore.commitTransition(DOC, uuid, 1L, 100L, 10L, "alice", "submit", null);
+        // 模拟锁失效后的迟到双写：仍以旧状态/旧版本发起 → 条件更新失败
+        assertThatThrownBy(() -> docDataStore.commitTransition(
+                DOC, uuid, 1L, 100L, 10L, "bob", "submit", null))
                 .isInstanceOf(TsConditionCheckException.class);
         // 无脏写：主行仍为 10/version=2，历史行无重复 seq
         mockMvc.perform(get("/api/v1/data/doc/{doc}/{uuid}", DOC, uuid))
@@ -378,8 +384,8 @@ class DocTransitionApiTest {
                         .content("{\"attributes\": {\"amount\": 200}, \"version\": 1}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.version").value(2));
-        // 提交后：修改 40008、删除 40009
-        docDataStore.commitTransition(DOC, uuid, 100L, 10L, "alice", "submit", null);
+        // 提交后：修改 40008、删除 40009（属性修改后 version=2）
+        docDataStore.commitTransition(DOC, uuid, 2L, 100L, 10L, "alice", "submit", null);
         mockMvc.perform(put("/api/v1/data/doc/{doc}/{uuid}", DOC, uuid)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"attributes\": {\"amount\": 300}, \"version\": 3}"))
@@ -396,6 +402,87 @@ class DocTransitionApiTest {
         mockMvc.perform(get("/api/v1/data/doc/{doc}/{uuid}", DOC, draft))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value(ErrorCode.NOT_FOUND.getCode()));
+    }
+
+    @Test
+    @DisplayName("单据字段约束：类型/长度/精度/引用/唯一/只读/合并更新全部经服务端执行（META-01/DATA-01）")
+    void docFieldConstraints_enforced() throws Exception {
+        configGateway.definition = constrainedDefinition();
+
+        // 整数校验、decimal 精度、string 长度
+        createExpectBad("{\"attributes\": {\"qty\": 1.5, \"price\": 10, \"code\": \"A1\"}}",
+                ErrorCode.TYPE_INVALID);
+        createExpectBad("{\"attributes\": {\"qty\": 1, \"price\": 10.123, \"code\": \"A1\"}}",
+                ErrorCode.TYPE_INVALID);
+        createExpectBad("{\"attributes\": {\"qty\": 1, \"price\": 10, \"code\": \"TOOLONG\"}}",
+                ErrorCode.TYPE_INVALID);
+
+        // 引用不存在 → 40004；播种有效客户后可创建
+        createExpectBad("{\"attributes\": {\"qty\": 1, \"price\": 10, \"code\": \"A1\","
+                + " \"customer\": \"missing-ref\"}}", ErrorCode.REF_INVALID);
+        String refUuid = java.util.UUID.randomUUID().toString();
+        long now = System.currentTimeMillis();
+        entityRepository.insert(new com.example.runtime.domain.model.EntityDataRecord(
+                refUuid, "customer", "entity", 1, 1L, java.util.Map.of("name", "客户A"),
+                java.util.List.of(), "alice", "sales", now, now));
+
+        MvcResult created = mockMvc.perform(post("/api/v1/data/doc/{doc}", DOC)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"attributes\": {\"qty\": 1, \"price\": 10, \"code\": \"A1\","
+                                + " \"customer\": \"" + refUuid + "\"}}"))
+                .andExpect(status().isOk())
+                .andReturn();
+        String uuid = mapper.readTree(created.getResponse().getContentAsString())
+                .get("data").get("uuid").asText();
+
+        // 唯一约束：重复编码 → 40005
+        createExpectBad("{\"attributes\": {\"qty\": 2, \"price\": 20, \"code\": \"A1\"}}",
+                ErrorCode.UNIQUE_CONFLICT);
+
+        // 局部更新：未提交字段保留；只读编码未提交不校验
+        mockMvc.perform(put("/api/v1/data/doc/{doc}/{uuid}", DOC, uuid)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"attributes\": {\"qty\": 3}, \"version\": 1}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.version").value(2));
+        mockMvc.perform(get("/api/v1/data/doc/{doc}/{uuid}", DOC, uuid))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.attributes.qty").value(3))
+                .andExpect(jsonPath("$.data.attributes.price").value(10))
+                .andExpect(jsonPath("$.data.attributes.code").value("A1"))
+                .andExpect(jsonPath("$.data.attributes.customer").value(refUuid));
+
+        // 只读字段变更 → 40007
+        mockMvc.perform(put("/api/v1/data/doc/{doc}/{uuid}", DOC, uuid)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"attributes\": {\"code\": \"B1\"}, \"version\": 2}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value(ErrorCode.NOT_EDITABLE.getCode()));
+    }
+
+    /** 受限字段定义：integer/decimal(2)/string(5, unique, readonly)/ref */
+    private static DocDefinition constrainedDefinition() {
+        Map<Long, DocStateDef> statusDefs = new LinkedHashMap<>();
+        statusDefs.put(100L, new DocStateDef(100L, "暂存", true, false));
+        statusDefs.put(10L, new DocStateDef(10L, "已提交", false, false));
+        List<DocAttribute> attributes = List.of(
+                new DocAttribute("qty", "数量", "integer", true, false,
+                        null, null, List.of(), true, 6, 200),
+                new DocAttribute("price", "价格", "decimal", true, false,
+                        null, null, List.of(), true, 2, 200),
+                new DocAttribute("code", "编码", "string", true, true,
+                        null, null, List.of(), false, 6, 5),
+                new DocAttribute("customer", "客户", "ref", false, false,
+                        "customer", "name", List.of(), true, 6, 200));
+        return new DocDefinition(DOC, "受限订单", 1L, attributes, statusDefs);
+    }
+
+    private void createExpectBad(String body, ErrorCode errorCode) throws Exception {
+        mockMvc.perform(post("/api/v1/data/doc/{doc}", DOC)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value(errorCode.getCode()));
     }
 
     @Test

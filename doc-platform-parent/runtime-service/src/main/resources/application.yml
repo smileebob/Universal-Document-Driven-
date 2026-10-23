@@ -115,7 +115,8 @@ doc:
     outbox:
       scan-interval-ms: 5000          # 5s 定时扫描兜底（即时首发之外的滞留行）
       scan-initial-delay-ms: 10000
-      archive-enabled: false          # 已发送行 7 天归档清理默认关（骨架）
+      archive-enabled: false          # 已发送行（>7天）清理默认关；这是删除，不是持久归档
+      archive-dry-run: true           # 默认仅统计候选；确认保留策略后再关闭 dry-run
       archive-interval-ms: 3600000
 
 # 新增：RocketMQ（Outbox 中继投递 + schema 缓存失效广播消费；敏感值走环境变量，R-05）
@@ -164,3 +165,7 @@ doc:
     bootstrap:
       # 仿真模式启动一律自动建表（内存存储重启即空）；此处显式置 true 保持语义自解释
       auto-create: true
+  auth:
+    role-check:
+      # dev demo 显式放行无角色请求（网关认证关闭时无角色注入）；生产默认拒绝，禁止继承本值
+      deny-unauthenticated: false

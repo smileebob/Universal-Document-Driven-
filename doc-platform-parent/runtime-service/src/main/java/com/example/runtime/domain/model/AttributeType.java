@@ -17,7 +17,11 @@ public enum AttributeType {
 
     /** 字符串（maxLength 约束） */
     STRING,
-    /** 数值（整数/小数统一承载） */
+    /** 整数 */
+    INTEGER,
+    /** 小数（precision 约束小数位上限） */
+    DECIMAL,
+    /** 数值（旧定义兼容：不区分整数/小数） */
     NUMBER,
     /** 布尔 */
     BOOLEAN,
@@ -43,7 +47,9 @@ public enum AttributeType {
             case "string":
                 return STRING;
             case "integer":
+                return INTEGER;
             case "decimal":
+                return DECIMAL;
             case "number":
                 return NUMBER;
             case "boolean":

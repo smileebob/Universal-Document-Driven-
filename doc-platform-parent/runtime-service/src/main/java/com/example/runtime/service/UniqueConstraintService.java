@@ -55,7 +55,7 @@ public class UniqueConstraintService {
             }
             String normalized = UniqueValues.normalize(value);
             if (!uniqueIndexStore.tryReserve(schema.getCode(), def.getCode(), normalized, ownerUuid)) {
-                releaseAll(schema.getCode(), reserved);
+                releaseAll(schema.getCode(), reserved, ownerUuid);
                 throw conflict(def);
             }
             reserved.add(new Reserved(def.getCode(), normalized));
@@ -83,7 +83,7 @@ public class UniqueConstraintService {
             }
             String normalized = UniqueValues.normalize(newValue);
             if (!uniqueIndexStore.tryReserve(schema.getCode(), def.getCode(), normalized, ownerUuid)) {
-                releaseAll(schema.getCode(), reserved);
+                releaseAll(schema.getCode(), reserved, ownerUuid);
                 throw conflict(def);
             }
             reserved.add(new Reserved(def.getCode(), normalized));
@@ -99,14 +99,15 @@ public class UniqueConstraintService {
      * @param newAttributes 合并后属性值
      */
     public void releaseChangedOldValues(EntitySchema schema, Map<String, Object> oldAttributes,
-                                        Map<String, Object> newAttributes) {
+                                        Map<String, Object> newAttributes, String ownerUuid) {
         for (AttributeDef def : schema.uniqueAttributes()) {
             Object oldValue = oldAttributes.get(def.getCode());
             // 同 reserveChanged：归一化串比较，避免数值同值异构误判为换值（评审修复 Major-5）
             if (oldValue == null || sameNormalized(oldValue, newAttributes.get(def.getCode()))) {
                 continue;
             }
-            uniqueIndexStore.release(schema.getCode(), def.getCode(), UniqueValues.normalize(oldValue));
+            uniqueIndexStore.release(schema.getCode(), def.getCode(),
+                    UniqueValues.normalize(oldValue), ownerUuid);
         }
     }
 
@@ -131,10 +132,11 @@ public class UniqueConstraintService {
      *
      * @param targetCode 实体编码
      * @param reserved   已占位列表
+     * @param ownerUuid  占位属主（条件释放，防止误删易主后的新占位）
      */
-    public void releaseAll(String targetCode, List<Reserved> reserved) {
+    public void releaseAll(String targetCode, List<Reserved> reserved, String ownerUuid) {
         for (Reserved item : reserved) {
-            uniqueIndexStore.release(targetCode, item.attrCode(), item.value());
+            uniqueIndexStore.release(targetCode, item.attrCode(), item.value(), ownerUuid);
         }
     }
 

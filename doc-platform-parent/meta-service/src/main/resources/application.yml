@@ -128,3 +128,7 @@ doc:
     bootstrap:
       # Simulation mode always auto-creates tables (in-memory store empty on restart)
       auto-create: true
+  auth:
+    role-check:
+      # dev demo 显式放行无角色请求（网关认证关闭时无角色注入）；生产默认拒绝，禁止继承本值
+      deny-unauthenticated: false

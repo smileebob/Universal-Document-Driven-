@@ -40,7 +40,8 @@ function onUserMenuClick(info: { key: string }): void {
     void router.push('/login');
     return;
   }
-  // 切换角色（mock）：角色变化后回到工作台，由守卫重新做权限判定
+  // 演示模式才允许切换演示角色；真实模式角色来自已验证身份
+  if (!userStore.demoLogin) return;
   userStore.switchRole(info.key as Role);
   void router.push('/biz');
 }
@@ -166,15 +167,17 @@ onMounted(() => {
           </span>
           <template #overlay>
             <a-menu @click="onUserMenuClick">
-              <a-menu-item-group title="切换角色（mock）">
-                <a-menu-item
-                  v-for="(label, key) in ROLE_LABELS"
-                  :key="key"
-                >
-                  {{ label }}
-                </a-menu-item>
-              </a-menu-item-group>
-              <a-menu-divider />
+              <template v-if="userStore.demoLogin">
+                <a-menu-item-group title="切换演示角色（不代表真实授权）">
+                  <a-menu-item
+                    v-for="(label, key) in ROLE_LABELS"
+                    :key="key"
+                  >
+                    {{ label }}
+                  </a-menu-item>
+                </a-menu-item-group>
+                <a-menu-divider />
+              </template>
               <a-menu-item key="__logout">
                 退出登录
               </a-menu-item>

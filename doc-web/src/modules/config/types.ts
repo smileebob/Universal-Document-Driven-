@@ -62,13 +62,60 @@ export const MENU_GROUP_LABELS: Record<MenuGroupCode, string> = {
   ops: '运营监控',
 };
 
-/** 菜单挂载配置（EC-05） */
+/** 菜单挂载配置（EC-05，编辑器内部模型；落库字段统一为 enabled） */
 export interface MenuMountConfig {
-  mounted: boolean;
+  enabled: boolean;
   menu_name?: string;
   icon?: string;
   sort_order?: number;
   group_code?: MenuGroupCode | '';
+}
+
+/** PUT /schema/{type}/{code}/menu 请求体（menu_name 必填非空） */
+export interface MenuMountPayload {
+  menu_name: string;
+  icon?: string;
+  group_code?: MenuGroupCode | '';
+  sort_order?: number;
+  enabled: boolean;
+}
+
+/** GET /schema/{type}/{code}/menu 响应（后端 snake_case） */
+export interface MenuMountView {
+  target_type: ObjType;
+  target_code: string;
+  menu_name: string | null;
+  icon?: string | null;
+  group_code?: MenuGroupCode | '' | null;
+  sort_order?: number | null;
+  enabled: boolean;
+}
+
+/** 新建定义时的默认菜单配置（默认不挂载） */
+export function defaultMenuConfig(group: MenuGroupCode): MenuMountConfig {
+  return { enabled: false, menu_name: '', group_code: group, sort_order: 0 };
+}
+
+/** 编辑器模型 → 独立挂载接口报文；菜单名留空时使用定义名称的实际值 */
+export function toMenuMountPayload(config: MenuMountConfig, fallbackName: string): MenuMountPayload {
+  return {
+    menu_name: config.menu_name?.trim() || fallbackName.trim(),
+    icon: config.icon,
+    group_code: config.group_code ?? '',
+    sort_order: config.sort_order ?? 0,
+    enabled: config.enabled,
+  };
+}
+
+/** 独立挂载接口响应 → 编辑器模型（保留已停用配置的名称/分组） */
+export function fromMenuMountView(view: MenuMountView): MenuMountConfig {
+  return {
+    enabled: !!view.enabled,
+    menu_name: view.menu_name ?? '',
+    icon: view.icon ?? undefined,
+    group_code: view.group_code ?? '',
+    sort_order: view.sort_order ?? 0,
+  };
 }
 
 export interface EntitySchema {

@@ -64,8 +64,9 @@ public class TablestoreAutoConfiguration {
      * 无条件装配：eager 单例保证任何上下文刷新时优先生效。
      */
     @Bean
-    public TablestoreModeValidator tablestoreModeValidator(TablestoreProperties properties) {
-        return new TablestoreModeValidator(properties);
+    public TablestoreModeValidator tablestoreModeValidator(TablestoreProperties properties,
+                                                           Environment environment) {
+        return new TablestoreModeValidator(properties, environment);
     }
 
     /** 指标打点器（无 MeterRegistry 时 NOOP，不打点不报错） */

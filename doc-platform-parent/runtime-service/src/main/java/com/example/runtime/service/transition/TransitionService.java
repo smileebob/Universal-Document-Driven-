@@ -24,6 +24,7 @@ import com.example.runtime.domain.model.DocDefinition;
 import com.example.runtime.domain.model.DocStateMachine;
 import com.example.runtime.domain.port.DocConfigGateway;
 import com.example.runtime.domain.port.DocDataStore;
+import com.example.runtime.domain.saga.SagaStatus;
 import com.example.runtime.domain.saga.TxPlan;
 import com.example.runtime.domain.port.DocTransitionAbortException;
 import com.example.runtime.service.AuditService;
@@ -176,8 +177,18 @@ public class TransitionService {
             if (plan != null) {
                 sagaId = SagaOrchestrator.deriveSagaId(idempotencyKey, uuid, targetStatus);
                 try {
-                    sagaOrchestrator.execute(sagaId, plan, docCode, uuid, currentStatus,
-                            targetStatus, operator);
+                    SagaOrchestrator.SagaResult sagaResult = sagaOrchestrator.execute(
+                            sagaId, plan, docCode, uuid, currentStatus, targetStatus, operator);
+                    // 幂等重放可能回放 COMPENSATED/DEAD：不得继续提交单据
+                    if (sagaResult != null && sagaResult.status() != SagaStatus.COMPLETED) {
+                        Map<String, Object> data = new LinkedHashMap<>();
+                        data.put("saga_id", sagaId);
+                        data.put("saga_status", sagaResult.status() == null
+                                ? "UNKNOWN" : sagaResult.status().getCode());
+                        throw new BizException(ErrorCode.TX_FAILED,
+                                "事务步骤此前未成功完成（" + data.get("saga_status")
+                                        + "），不可提交单据", data);
+                    }
                     sagaTriggered = true;
                 } catch (SagaOrchestrator.SagaCompensatedException e) {
                     // 冲正成功：单据状态不变，42202 + saga 证据
@@ -199,19 +210,22 @@ public class TransitionService {
             // ⑤⑥ 局部事务收口 T1-T6（冲突退避由模板内置；条件失败映射 40901）
             DocDataStore.TransitionOutcome outcome;
             try {
-                outcome = docDataStore.commitTransition(docCode, uuid, currentStatus,
-                        targetStatus, operator, event, sagaId);
+                outcome = docDataStore.commitTransition(docCode, uuid, record.getVersion(),
+                        currentStatus, targetStatus, operator, event, sagaId);
             } catch (DocTransitionAbortException e) {
-                // 事务内发现行缺失/已删（锁内竞态兜底）
+                // 事务内发现行缺失/已删（锁内竞态兜底）：外部步骤必须冲正
+                compensateAfterCommitFailure(sagaId);
                 throw new BizException(ErrorCode.NOT_FOUND, e.getMessage());
             } catch (TsConditionCheckException e) {
-                // OTSConditionCheckFail：不重试，直接 40901（区分于退避路径）
+                // OTSConditionCheckFail：外部步骤已成功，先冲正再返回 40901
+                String suffix = compensateAfterCommitFailure(sagaId);
                 throw new BizException(ErrorCode.STATUS_CONFLICT,
-                        "单据已被并发流转修改，请刷新后重试", e);
+                        "单据已被并发修改" + suffix + "，请刷新后重试", e);
             } catch (TsOperationConflictException e) {
-                // 退避 50/150/450ms×3 后仍冲突：按可重试冲突返回 40901
+                // 退避 50/150/450ms×3 后仍冲突：同样先冲正再按可重试冲突返回
+                String suffix = compensateAfterCommitFailure(sagaId);
                 throw new BizException(ErrorCode.STATUS_CONFLICT,
-                        "存储层并发冲突，请重试", e);
+                        "存储层并发冲突" + suffix + "，请重试", e);
             }
 
             // ⑤.5 outbox 即时首发（事务外）：内存队列异步入队，失败由 5s 扫描兜底
@@ -245,6 +259,40 @@ public class TransitionService {
                 lock.unlock();
             }
         }
+    }
+
+    /**
+     * 本地提交失败时冲正已成功的外部步骤（TX-03 收口）。
+     * 冲正失败转死信并直接抛出 42202，避免用户误以为单据已回滚。
+     *
+     * @param sagaId Saga 实例 ID（无外部步骤时为 null）
+     * @return 面向用户的冲突提示后缀（无外部步骤为空；冲正结果未知时明确提示人工核对）
+     */
+    private String compensateAfterCommitFailure(String sagaId) {
+        if (sagaId == null) {
+            return "";
+        }
+        SagaStatus status;
+        try {
+            status = sagaOrchestrator.compensateAfterCommitFailure(sagaId);
+        } catch (RuntimeException e) {
+            log.error("[transition] 提交失败后的冲正异常，需人工核对: sagaId={}", sagaId, e);
+            status = SagaStatus.DEAD;
+        }
+        if (status == SagaStatus.DEAD) {
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("saga_id", sagaId);
+            data.put("saga_status", "DEAD");
+            throw new BizException(ErrorCode.TX_FAILED,
+                    "单据提交冲突，外部步骤冲正失败，已转死信人工处置", data);
+        }
+        if (status == SagaStatus.COMPENSATED) {
+            log.warn("[transition] 本地提交失败，外部步骤已冲正: sagaId={}", sagaId);
+            return "，外部步骤已冲正";
+        }
+        log.error("[transition] 本地提交失败，外部步骤冲正状态未知: sagaId={}, status={}",
+                sagaId, status);
+        return "，外部步骤冲正状态未知，请人工核对";
     }
 
     // ==================== 校验拒绝审计（事务外尽力而为） ====================

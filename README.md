@@ -4,119 +4,187 @@
 
 ## 项目定位
 
-通用单据驱动平台是一个**开源的单据/订单共享服务**，面向制造业与销售领域的各类业务系统——CRM、WMS、ERP、订单管理等。它让各业务系统基于**统一的技术标准**（统一的实体/单据建模、状态机、规则引擎与事务模型）快速获得单据与订单类能力，而无需各自重复建设。
+通用单据驱动平台是一个**开源的单据/订单共享服务**，面向制造业与销售领域的业务系统——CRM、WMS、ERP、订单管理等。它把实体/单据建模、状态机、校验规则与事务编排收敛为一套统一能力，让业务系统复用同一套单据语义，而不是各自重复实现。
 
-平台要解决的核心问题：
+平台要解决的两个问题：
 
-- **防止烟囱式（siloed）应用**：避免每个业务系统各自重复实现一套单据逻辑，造成标准不一、语义分裂、集成困难；
-- **简化后期数据治理**：单据模型、状态语义、数据标准全局统一，跨系统数据口径一致，天然便于汇总、追溯与治理。
+- **防止烟囱式应用**：避免每个系统各写一套单据逻辑，导致标准不一、语义分裂、难以集成；
+- **降低数据治理成本**：单据模型、状态语义与字段约束全局一致，跨系统汇总、追溯和对账更容易。
 
-## 核心能力
+**适合**：需要快速构建或统一多套“带生命周期的业务单据”的开发/实施团队。
+**不适合**：文件（PDF/Word）管理、完整 ERP、复杂多级审批工作流、多租户 SaaS 平台。这些不是当前实现目标。
 
-- **元数据驱动的实体与单据建模**：字段定义、校验规则、引用关系、唯一约束，全部零代码配置、由元数据驱动；
-- **状态机引擎**：单据状态与流转事件、并发与一致性控制（乐观并发 + 状态流转时间线）、AntV G6 可视化编辑；
-- **规则引擎**：校验规则、计算规则与状态/事件绑定，SpEL 沙箱执行；
-- **事务与消息**：Transactional Outbox 事务消息、Saga 编排、缓存失效广播；
-- **运行时统一数据服务**：单据创建/查询/状态流转/明细时间线，全部走统一运行时接口；
-- **运营监控**：健康检查、可观测性端点、审计追溯。
+## 设计思想
 
-技术栈：Spring Boot 3.5 / Spring Cloud Alibaba（Nacos / Sentinel / Gateway）、阿里云 Tablestore（含本地 simulation 模式）、Redis、RocketMQ（含本地 mock 模式）、Vue 3 + Vite + Ant Design Vue + AntV G6。
+1. **元数据是一份可执行业务定义**：字段、类型、必填、只读、唯一、精度、引用、状态与校验规则都由配置产生，前端渲染与服务端校验共用同一份定义。
+2. **配置域与运行域分离**：`meta-service` 管理定义与发布，`runtime-service` 解释定义执行业务，`doc-gateway` 是唯一外部入口。
+3. **状态流转是业务命令**：单据状态只能通过流转入口改变，普通属性更新不能绕过状态机、规则、并发控制和历史记录。
+4. **按物理边界设计一致性**：主键点查强一致；列表依赖异步索引；单分区事务、Saga 补偿、Outbox 事件各自有明确边界，不把它们说成全局强一致事务。
+5. **先契约、再实现、后验收**：需求 → 设计 → 接口/存储约束 → 分阶段交付 → 真实契约验证；AI 辅助开发只是研发方式，不是平台内置业务能力。
+
+```text
+配置控制台 ──定义/发布──▶ meta-service（实体、单据、状态机、规则、事务步骤）
+                                      │ 发布失效广播
+业务页面/外部系统 ──▶ doc-gateway ──▶ runtime-service（数据、流转、查询、事件、Saga）
+                                      │
+                          Tablestore / Redis / RocketMQ
+```
+
+## 核心能力与边界
+
+| 能力 | 当前实现 | 边界 |
+|---|---|---|
+| 实体与单据建模 | 头属性、明细表、引用、唯一、必填、只读、长度/精度配置 | 不支持公式计算、自动赋值与字段联动 |
+| 动态页面 | 元数据驱动列表、表单、详情、状态时间线 | 特殊交互页面仍需定制开发 |
+| 状态机 | 流转路径配置、合法性校验、并发控制、状态历史 | 不是通用 BPM/多级审批引擎 |
+| 校验规则 | SpEL 表达式校验 + 接口调用校验，按状态/新增动作绑定 | 规则只做校验，不修改业务数据 |
+| 事务与事件 | 外部步骤顺序执行、失败逆序冲正、Outbox 事件、死信处理 | 跨表投影为最终一致；生产需按真实中间件演练 |
+| 查询与审计 | 统一查询 DSL、分页/筛选/排序、操作审计与状态历史 | 深分页受索引语义限制；审计保留策略需按部署配置 |
+| 权限 | 平台管理员 / 业务管理员 / 业务用户的功能级授权 | 多租户、组织隔离、字段级权限不在本期 |
+
+## 一条业务主线
+
+1. 管理员定义基础实体（产品、客户等）并发布；
+2. 定义单据头、明细与状态集合，配置状态机、校验规则和可选外部事务步骤；
+3. 发布定义并挂载菜单；
+4. 业务用户创建单据，执行提交/审核/下达等流转；
+5. 流转触发规则校验、并发控制、外部步骤与事件；成功后可在详情、历史与运营页面追溯。
+
+## 技术栈
+
+Java 17 / Spring Boot 3.5 / Spring Cloud Alibaba 2025（Nacos、Sentinel、Gateway）/ 阿里云 Tablestore（支持本地 simulation）/ Redis / RocketMQ（支持本地 mock）/ Vue 3 + Vite + Ant Design Vue + AntV G6。
 
 ## 模块结构
 
-```
+```text
 Document-Driven/
-├── doc-platform-parent/        # 后端（Maven 聚合工程）
-│   ├── doc-gateway/            # API 网关（路由、JWT 认证、限流）
-│   ├── meta-service/           # 元数据服务（实体/单据定义/状态机/规则配置管理）
-│   ├── runtime-service/        # 运行时服务（单据数据、状态流转、事务）
-│   ├── meta-service-api/       # meta-service 对外契约（Feign/DTO）
-│   ├── runtime-service-api/    # runtime-service 对外契约（Feign/DTO）
-│   ├── doc-common/             # 公共库（Tablestore 防腐层、缓存、消息门面、领域基础）
-│   ├── deploy/                 # 部署脚本（app.sh：启动/停止/状态/重启）
-│   └── docs/                   # 工程文档（含提交前审核清单）
-└── doc-web/                    # 前端（Vue 3 + Vite，配置控制台 + 运行时业务页面 + 运营监控）
+├── doc-platform-parent/          # 后端（Maven 聚合工程）
+│   ├── doc-gateway/              # 网关：路由、JWT 认证、限流、CORS
+│   ├── meta-service/             # 配置域：定义、发布、菜单、缓存失效
+│   ├── runtime-service/          # 运行域：数据、流转、查询、事件、Saga、运营
+│   ├── meta-service-api/         # 配置域 Feign 契约与 DTO
+│   ├── runtime-service-api/      # 运行域 Feign 契约与 DTO
+│   ├── doc-common/               # 存储/缓存/消息防腐层、统一异常与安全组件
+│   ├── deploy/                   # 开发/联调部署脚本
+│   └── docs/                     # 提交审核清单、OpenAPI、性能基线、告警规则
+└── doc-web/                      # Vue 3 前端（配置控制台 + 运行页面 + 运营监控）
 ```
 
 ## 快速开始
 
-### 零云资源本地运行（dev profile + simulation 模式）
+### 前置条件
 
-后端支持**零云依赖**启动：dev profile 下 Tablestore 默认走内存 simulation 模式（`OTS_MODE=simulation`），消息默认走 mock 模式（`DOC_MQ_MODE=mock`），无需任何阿里云资源即可本地跑通全流程。
+| 依赖 | 要求 | 说明 |
+|---|---|---|
+| JDK / Maven | JDK 17+、Maven 3.8+ | 后端构建 |
+| Node.js / npm | Node 20+ | 前端构建 |
+| Nacos | 本地单机即可 | 网关与服务的注册/发现必需 |
+| Redis | 本地单机即可 | 分布式锁、缓存与 mock 消息桥接 |
+
+**“零云资源”不等于“零本地中间件”**：dev 模式下 Tablestore 使用内存仿真、RocketMQ 使用进程内 mock，但 Nacos 与 Redis 仍需本地可用（默认 `127.0.0.1:8848` / `127.0.0.1:6379`）。仿真数据重启即丢失，mock 消息不证明真实 MQ 投递语义。
+
+### 1. 构建后端
 
 ```bash
-# 1. 构建（在 doc-platform-parent 目录下）
+cd doc-platform-parent
 mvn clean package -DskipTests
+```
 
-# 2. 依次启动三个服务（端口 8080/8081/8082）
-java -jar doc-gateway/target/doc-gateway-*.jar        # 网关 :8080
-java -jar meta-service/target/meta-service-*.jar      # 元数据服务 :8081
-java -jar runtime-service/target/runtime-service-*.jar # 运行时服务 :8082
+### 2. 启动三个服务（各开一个终端，均设置 dev profile）
 
-# 3. 启动前端（端口 5173）
-cd doc-web
+```bash
+# 环境变量（三个终端一致；bash 写法）
+export SPRING_PROFILES_ACTIVE=dev
+export OTS_MODE=simulation
+export DOC_MQ_MODE=mock
+```
+
+```bash
+# 终端 A：网关（:8080，dev profile 默认关闭认证，便于本地演示）
+java -jar doc-gateway/target/doc-gateway-*.jar
+
+# 终端 B：配置域（:8081）
+java -jar meta-service/target/meta-service-*.jar
+
+# 终端 C：运行域（:8082）
+java -jar runtime-service/target/runtime-service-*.jar
+```
+
+PowerShell 对应写法：`$env:SPRING_PROFILES_ACTIVE="dev"; $env:OTS_MODE="simulation"; $env:DOC_MQ_MODE="mock"`，然后在各终端启动。
+
+启动成功的判断标准：三个进程日志无持续异常，且 `curl http://localhost:8080/actuator/health`、`:8081`、`:8082` 返回 `UP`。首个管理员定义需通过 API 或前端创建；项目不内置可复用的生产账号。
+
+### 3. 启动前端
+
+```bash
+cd doc-web        # 从仓库根目录执行
 npm install
 npm run dev
 ```
 
-> 注：dev profile 下若本机无 Nacos/Redis，相关组件按 application.yml 中的占位默认值降级运行；如需接入真实 Nacos/Redis/Tablestore/RocketMQ，通过环境变量注入即可（见下节）。
+打开 `http://localhost:5173`。本地登录为**演示登录**（默认允许选择角色，仅用于开发演示，不代表真实权限体系）；生产必须接入真实身份提供方并开启网关认证。
 
-### 敏感配置一律环境变量注入
+### 4. 停止
 
-本项目遵循**敏感值零明文**原则：所有密钥、接入点、账号密码均不写入代码与配置文件，统一通过环境变量注入（application.yml 中以 `${ENV:默认值}` 占位符引用，未注入时回落到仅限开发环境的本地默认值）。
+开发脚本可按服务停止：`cd doc-platform-parent && ./deploy/app.sh stop doc-gateway`（脚本仅供开发/联调；生产请使用 systemd 或容器编排并配置健康探针）。
 
-## 环境变量清单
+## 环境变量
+
+### 开发必需
+
+| 变量 | 本地默认 | 说明 |
+|---|---|---|
+| `NACOS_SERVER_ADDR` / `NACOS_NAMESPACE` | `127.0.0.1:8848` / 空 | 注册与配置中心 |
+| `REDIS_HOST` / `REDIS_PORT` | `127.0.0.1` / `6379` | 缓存、锁、mock 桥接 |
+| `REDIS_USERNAME` / `REDIS_PASSWORD` | 空 | Redis ACL 凭据（生产必须注入） |
+| `OTS_MODE` | dev 下 `simulation` | `simulation`（仅 dev/test）或 `ots` |
+| `DOC_MQ_MODE` | `mock` | `mock`（仅 dev/test）或 `rocketmq` |
+| `SERVER_PORT` | 8080/8081/8082 | 各服务端口覆盖 |
+
+### 生产/真实中间件
 
 | 变量 | 说明 |
-| --- | --- |
-| `NACOS_SERVER_ADDR` | Nacos 注册/配置中心地址 |
-| `NACOS_NAMESPACE` | Nacos 命名空间 |
-| `REDIS_HOST` / `REDIS_PORT` | Redis 地址与端口 |
-| `REDIS_USERNAME` / `REDIS_PASSWORD` | Redis 认证账号（ACL） |
-| `REDIS_TIMEOUT_MS` / `REDIS_CONNECT_TIMEOUT_MS` | Redis 超时参数 |
-| `OTS_MODE` | Tablestore 装配模式：`ots`（真实实例，默认）/ `simulation`（内存模拟，仅 dev/test） |
-| `OTS_ENDPOINT` / `OTS_INSTANCE` | Tablestore 实例接入点与实例名 |
-| `OTS_ACCESS_KEY_ID` / `OTS_ACCESS_KEY_SECRET` | Tablestore 访问密钥 |
-| `OTS_AUTO_CREATE` | 启动自动建表开关（dev/test 用，生产禁用） |
-| `DOC_MQ_MODE` | 消息门面模式：`mock`（默认，进程内模拟 + Redis Pub/Sub 桥接）/ `rocketmq`（真实 RocketMQ） |
-| `ROCKETMQ_ENDPOINT` | RocketMQ 接入点（name-server 语义） |
-| `ROCKETMQ_ACCESS_KEY` / `ROCKETMQ_SECRET_KEY` | RocketMQ 访问密钥 |
-| `GATEWAY_JWT_SECRET` | 网关 JWT 签名密钥（HS256） |
-| `GATEWAY_AUTH_ENABLED` | 网关认证开关 |
+|---|---|
+| `OTS_ENDPOINT` / `OTS_INSTANCE` | Tablestore 接入点与实例名 |
+| `OTS_ACCESS_KEY_ID` / `OTS_ACCESS_KEY_SECRET` | Tablestore 凭据 |
+| `OTS_AUTO_CREATE` | 启动自动建表（生产必须为 false） |
+| `ROCKETMQ_ENDPOINT` / `ROCKETMQ_ACCESS_KEY` / `ROCKETMQ_SECRET_KEY` | RocketMQ 接入配置 |
+| `GATEWAY_JWT_SECRET` | 网关 JWT 签名密钥（HS256，生产要求 ≥32 字节） |
+| `GATEWAY_JWT_ISSUER` / `GATEWAY_JWT_AUDIENCE` | 可选强校验；配置后不匹配的令牌被拒绝 |
+| `GATEWAY_TRUSTED_PROXIES` | 可信反向代理地址（逗号分隔；仅这些来源的 XFF 被采信） |
+| `GATEWAY_AUTH_ENABLED` | 生产必须为 true；dev profile 默认 false |
+| `CORS_ALLOWED_ORIGIN_PATTERNS` | 网关允许的来源白名单（禁止 `*` + credentials） |
+| `SENTINEL_DASHBOARD` | Sentinel 控制台地址（仅监控；规则以 Nacos 为准） |
 
-> 权威清单与注入方式（export / `/etc/environment` / systemd EnvironmentFile）见 [`doc-platform-parent/deploy/app.sh`](doc-platform-parent/deploy/app.sh) 的「环境变量注入说明」段落。
+### 调优（可选，均有默认值）
 
-### 运行时调优变量（可选，均有默认值）
+`DOC_CACHE_L1_TTL_MINUTES`（60）、`DOC_CACHE_L2_TTL_MINUTES`（5）、`DOC_CACHE_WARMUP_ENABLED`（true）、`DOC_SCHEMA_INVALIDATION_MQ`（true）、`RECONCILE_UNIQUE_ORPHAN`（false）、`REDIS_TIMEOUT_MS`（2000ms）、`REDIS_CONNECT_TIMEOUT_MS`（2000ms）。
 
-以下变量用于生产环境调优，未注入时均回落到配置文件中的默认值：
+> 生产启动校验：prod profile 下禁止 simulation、mock 消息、启动自动建表；网关必须开启认证并使用强密钥。配置不满足时服务 fail-fast，不会静默降级。
 
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `OUTBOX_POLL_INTERVAL_MS` | `1000` | Outbox 中继轮询间隔（毫秒） |
-| `OUTBOX_BATCH_SIZE` | `50` | Outbox 中继单批投递条数 |
-| `OUTBOX_MAX_RETRY` | `16` | Outbox 消息最大重试次数 |
-| `DOC_CACHE_L1_TTL_MINUTES` | `60` | 单据定义 L1（Redis）缓存 TTL（分钟） |
-| `DOC_CACHE_L2_TTL_MINUTES` | `5` | 单据定义 L2（本地 Caffeine）缓存 TTL（分钟） |
-| `DOC_CACHE_WARMUP_ENABLED` | `true` | 启动时缓存预热开关 |
-| `DOC_LOCK_WAIT_MS` | `0` | 状态流转分布式锁获取等待时间（毫秒） |
-| `DOC_LOCK_LEASE_MS` | `30000` | 状态流转分布式锁租约时长（毫秒） |
-| `MQ_TOPIC_DOC_EVENT` | `doc-event` | Outbox 投递的单据事件 Topic |
-| `MQ_TOPIC_CACHE_INVALIDATE` | `doc-cache-invalidate` | 缓存失效广播 Topic |
-| `MQ_GROUP_CACHE_INVALIDATE` | `doc-cache-invalidate-cg` | 缓存失效广播消费组 |
-| `SCHEMA_CACHE_TTL_SECONDS` | `300` | meta-service schema 缓存 TTL（秒，广播失效的 TTL 兜底） |
-| `RECONCILE_UNIQUE_ORPHAN` | `false` | 唯一约束孤儿记录定时对账开关（手动触发接口不受开关限制） |
-| `DOC_SCHEMA_INVALIDATION_MQ` | `true` | schema 失效 MQ 广播开关（关闭时退化为 Caffeine TTL 兜底） |
+## 已知边界与验证状态
 
-## 贡献指引
+- 规则引擎当前只做校验，不提供金额计算、赋值或字段联动；`unique` 约束当前仅对单据头字段生效，明细子字段的唯一范围未定义；
+- 状态流转的历史、事件、审计采用提交后补写与重试投影，属于最终一致；**提交后补写失败的极端窗口需依赖告警与人工对账**，高可靠场景上线前应完成恢复/对账演练；
+- 发布新增可检索字段会触发多元索引重建，重建窗口内列表检索可能短暂不可用；生产建议采用“异名候选索引 → 切流 → 下线旧索引”，当前代码仅记录该运维路径，未自动执行；
+- 多元索引为异步构建，写入后“立即按列表条件检索”可能短暂不可见，详情点查不受影响；
+- 多租户、复杂审批、打印模板、Excel 批量导入导出不在当前范围；
+- [性能基线](doc-platform-parent/docs/perf-report.md) 来自本地仿真环境，**不代表生产容量**；真实 OTS/RocketMQ/Redis 环境需重新压测；
+- 本轮代码整改已通过相关后端单元/接口测试；浏览器端与真实云环境验收仍需按部署环境执行。
 
-欢迎提交 Issue 与 Pull Request。请注意：
+## 接口与开发文档
 
-- **任何提交须先通过 [`doc-platform-parent/docs/commit-review-checklist.md`](doc-platform-parent/docs/commit-review-checklist.md) 定义的提交前审核清单**（黑名单路径检查、敏感串零容忍扫描、入库体积抽查），未通过审核清单的提交一律拒绝；
-- 后端遵循 Spring Cloud Alibaba 规范约束，前端遵循 Vue 规范，详见仓库内文档；
-- 提交信息请清晰描述变更动机与影响面。
+- [提交前审核清单](doc-platform-parent/docs/commit-review-checklist.md)
+- [OpenAPI 快照](doc-platform-parent/docs/openapi/)
+- [告警规则](doc-platform-parent/docs/alert-rules.md)
+- [仿真性能报告](doc-platform-parent/docs/perf-report.md)
+
+## 贡献
+
+欢迎 Issue 与 Pull Request。提交前必须通过[提交前审核清单](doc-platform-parent/docs/commit-review-checklist.md)（黑名单路径、敏感串零容忍、体积抽查）；后端遵循 Spring Cloud Alibaba 规范，前端遵循 Vue 规范。
 
 ## 许可证
 
-本项目基于 **GPL-3.0-or-later**（GNU General Public License v3.0 or later）开源，完整许可证文本见 [LICENSE](LICENSE)。
+本项目基于 **GPL-3.0-or-later** 开源，完整文本见 [LICENSE](LICENSE)。
 
 Copyright © 2026 Document-Driven Platform contributors.

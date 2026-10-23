@@ -29,6 +29,9 @@ public final class AttributeDef {
     /** STRING 最大长度（≤0 表示不限制） */
     private final int maxLength;
 
+    /** DECIMAL 小数位上限（≤0 表示不限制） */
+    private final int precision;
+
     /** 默认值原文（缺值时回填，可空） */
     private final Object defaultValue;
 
@@ -45,6 +48,14 @@ public final class AttributeDef {
                         boolean unique, String refEntityCode, int maxLength,
                         Object defaultValue, boolean editable, String displayField,
                         int sortOrder) {
+        this(code, name, type, required, unique, refEntityCode, maxLength, 0,
+                defaultValue, editable, displayField, sortOrder);
+    }
+
+    public AttributeDef(String code, String name, AttributeType type, boolean required,
+                        boolean unique, String refEntityCode, int maxLength, int precision,
+                        Object defaultValue, boolean editable, String displayField,
+                        int sortOrder) {
         if (code == null || code.isBlank()) {
             throw new IllegalArgumentException("属性编码不可为空");
         }
@@ -55,6 +66,7 @@ public final class AttributeDef {
         this.unique = unique;
         this.refEntityCode = refEntityCode;
         this.maxLength = maxLength;
+        this.precision = precision;
         this.defaultValue = defaultValue;
         this.editable = editable;
         this.displayField = displayField == null || displayField.isBlank() ? "name" : displayField;
@@ -87,6 +99,10 @@ public final class AttributeDef {
 
     public int getMaxLength() {
         return maxLength;
+    }
+
+    public int getPrecision() {
+        return precision;
     }
 
     public Object getDefaultValue() {

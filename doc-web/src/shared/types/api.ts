@@ -46,8 +46,9 @@ export class ApiError extends Error {
 }
 
 /**
- * 角色常量（prd/01 §2.1 权限矩阵；阶段四与后端 PlatformRoles 对齐，
- * 角色名经 X-User-Roles 头随请求下发，服务端 @RequireRoles 校验）
+ * 角色常量（prd/01 §2.1 权限矩阵；与后端 PlatformRoles 对齐）。
+ * 前端角色只控制展示与交互：演示模式可自选，真实模式应由已验证身份提供；
+ * 服务端始终是最终授权方。
  */
 export type Role = 'platform_admin' | 'business_admin' | 'business_user';
 

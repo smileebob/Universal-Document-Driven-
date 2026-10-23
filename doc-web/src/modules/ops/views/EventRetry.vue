@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // P-OP-03 事件重发监控页（prd/10）：Outbox 滞留事件手动重发 + 消费证据面板
-// 消费证据体现 Outbox 链路可观测（event_type/mode/消费时间）
-import { onMounted, ref } from 'vue';
+// 查询区块区分 idle/loading/success/error：失败不等同于链路正常，空结果仅表示当前查询范围为空
+import { computed, onMounted, ref } from 'vue';
 import { Modal, message } from 'ant-design-vue';
 import { listConsumedEvidences, listRetryableEvents, resendEvent } from '@/modules/ops/api/ops';
 import type { ConsumedEvidence, OutboxEventItem } from '@/modules/ops/types';
@@ -10,17 +10,43 @@ import { ApiError } from '@/shared/types/api';
 import { formatTime } from '@/shared/utils/format';
 import { toUserMessage } from '@/shared/utils/errorMessages';
 
+type LoadState = 'idle' | 'loading' | 'success' | 'error';
+
+interface LoadFailure {
+  message: string;
+  traceId?: string;
+}
+
+function toFailure(err: unknown, fallback: string): LoadFailure {
+  if (err instanceof ApiError) {
+    return { message: toUserMessage(err), traceId: err.traceId };
+  }
+  return { message: fallback };
+}
+
+const EVENT_LIMIT = 50;
+const EVIDENCE_LIMIT = 20;
+
 // ---------- 滞留事件 ----------
 const events = ref<OutboxEventItem[]>([]);
-const eventLoading = ref(false);
+const eventState = ref<LoadState>('idle');
+const eventError = ref<LoadFailure | null>(null);
+const eventTotal = ref(0);
+const eventLoading = computed(() => eventState.value === 'loading');
+const eventTruncated = computed(() => eventTotal.value > events.value.length);
 
 async function loadEvents(): Promise<void> {
-  eventLoading.value = true;
+  eventState.value = 'loading';
+  eventError.value = null;
   try {
-    const res = await listRetryableEvents(50);
+    const res = await listRetryableEvents(EVENT_LIMIT, { silent: true });
     events.value = res.items;
-  } finally {
-    eventLoading.value = false;
+    eventTotal.value = res.total;
+    eventState.value = 'success';
+  } catch (err) {
+    // 保留上次成功数据但明确标记为刷新失败，不把未知当正常
+    eventError.value = toFailure(err, '待处理事件查询失败，请稍后重试');
+    eventState.value = 'error';
   }
 }
 
@@ -34,7 +60,8 @@ function resend(record: OutboxEventItem): void {
     onOk: async () => {
       try {
         await resendEvent(record.event_id, { silent: true });
-        message.success('重发已受理');
+        // 受理只代表进入重投队列，不代表消费者已处理成功
+        message.success('重发已受理（受理不代表已投递，请以发送状态与消费证据为准）');
         void loadEvents();
         void loadEvidences();
       } catch (err) {
@@ -52,15 +79,23 @@ function sendStatusColor(status: number): string {
 
 // ---------- 消费证据 ----------
 const evidences = ref<ConsumedEvidence[]>([]);
-const evidenceLoading = ref(false);
+const evidenceState = ref<LoadState>('idle');
+const evidenceError = ref<LoadFailure | null>(null);
+const evidenceTotal = ref(0);
+const evidenceLoading = computed(() => evidenceState.value === 'loading');
+const evidenceTruncated = computed(() => evidenceTotal.value > evidences.value.length);
 
 async function loadEvidences(): Promise<void> {
-  evidenceLoading.value = true;
+  evidenceState.value = 'loading';
+  evidenceError.value = null;
   try {
-    const res = await listConsumedEvidences(20);
+    const res = await listConsumedEvidences(EVIDENCE_LIMIT, { silent: true });
     evidences.value = [...res.items].reverse();
-  } finally {
-    evidenceLoading.value = false;
+    evidenceTotal.value = res.total;
+    evidenceState.value = 'success';
+  } catch (err) {
+    evidenceError.value = toFailure(err, '消费证据查询失败，请稍后重试');
+    evidenceState.value = 'error';
   }
 }
 
@@ -93,11 +128,58 @@ onMounted(() => {
   <div class="flex flex-col gap-4">
     <a-card title="事件重发监控（Outbox 滞留事件）">
       <div class="mb-4 flex items-center gap-3">
-        <a-button @click="void loadEvents()">
+        <a-button
+          :loading="eventLoading"
+          @click="void loadEvents()"
+        >
           刷新
         </a-button>
         <span class="text-xs text-gray-400">列表仅展示待人工 / 滞留待发事件；已发送事件不出列</span>
       </div>
+
+      <!-- 查询失败：保留上次成功数据也要标注，不能显示为链路正常 -->
+      <a-alert
+        v-if="eventError"
+        type="error"
+        show-icon
+        class="mb-3"
+        message="待处理事件查询失败"
+      >
+        <template #description>
+          <div>{{ eventError.message }}</div>
+          <div
+            v-if="eventError.traceId"
+            class="mt-1 font-mono text-xs text-gray-500"
+          >
+            trace: {{ eventError.traceId }}
+          </div>
+          <div
+            v-if="events.length"
+            class="mt-1"
+          >
+            以下为上次成功数据，当前刷新失败。
+          </div>
+        </template>
+        <template #action>
+          <a-button
+            size="small"
+            :loading="eventLoading"
+            @click="void loadEvents()"
+          >
+            重试
+          </a-button>
+        </template>
+      </a-alert>
+
+      <!-- 固定 50 条上限：明确提示截断，不把 items.size 当作全量 -->
+      <a-alert
+        v-if="eventState === 'success' && eventTruncated"
+        type="warning"
+        show-icon
+        class="mb-3"
+        message="查询结果已截断"
+        :description="`接口当前固定最多返回 ${EVENT_LIMIT} 条，本次返回 ${events.length} 条，共 ${eventTotal} 条。请等待完整分页能力或缩小排查范围。`"
+      />
 
       <a-table
         :columns="eventColumns"
@@ -149,7 +231,22 @@ onMounted(() => {
         </template>
 
         <template #emptyText>
-          <a-empty description="当前无待处理事件，投递正常" />
+          <a-empty
+            v-if="eventState === 'error'"
+            description="查询失败，无法判断投递状态，请重试"
+          />
+          <a-empty
+            v-else-if="eventState === 'loading'"
+            description="正在查询…"
+          />
+          <a-empty
+            v-else-if="eventState === 'success'"
+            description="未查询到待处理事件（本次查询成功，当前范围为空）"
+          />
+          <a-empty
+            v-else
+            description="尚未查询"
+          />
         </template>
       </a-table>
     </a-card>
@@ -159,11 +256,59 @@ onMounted(() => {
       <template #extra>
         <a-button
           size="small"
+          :loading="evidenceLoading"
           @click="void loadEvidences()"
         >
           刷新
         </a-button>
       </template>
+
+      <div class="mb-3 text-xs text-gray-500">
+        本地 Outbox 发送状态与消费者处理证据是不同事实；“已发送”不代表消费方已处理成功。
+      </div>
+
+      <a-alert
+        v-if="evidenceError"
+        type="error"
+        show-icon
+        class="mb-3"
+        message="消费证据查询失败"
+      >
+        <template #description>
+          <div>{{ evidenceError.message }}</div>
+          <div
+            v-if="evidenceError.traceId"
+            class="mt-1 font-mono text-xs text-gray-500"
+          >
+            trace: {{ evidenceError.traceId }}
+          </div>
+          <div
+            v-if="evidences.length"
+            class="mt-1"
+          >
+            以下为上次成功数据，当前刷新失败。
+          </div>
+        </template>
+        <template #action>
+          <a-button
+            size="small"
+            :loading="evidenceLoading"
+            @click="void loadEvidences()"
+          >
+            重试
+          </a-button>
+        </template>
+      </a-alert>
+
+      <a-alert
+        v-if="evidenceState === 'success' && evidenceTruncated"
+        type="warning"
+        show-icon
+        class="mb-3"
+        message="消费证据已截断"
+        :description="`接口当前最多返回 ${EVIDENCE_LIMIT} 条，共 ${evidenceTotal} 条，仅展示最近 ${evidences.length} 条。`"
+      />
+
       <a-table
         :columns="evidenceColumns"
         :data-source="evidences"
@@ -195,7 +340,22 @@ onMounted(() => {
         </template>
 
         <template #emptyText>
-          <a-empty description="暂无消费记录（触发一次流转后将产生 doc_status_changed 事件证据）" />
+          <a-empty
+            v-if="evidenceState === 'error'"
+            description="查询失败，无法判断消费证据，请重试"
+          />
+          <a-empty
+            v-else-if="evidenceState === 'loading'"
+            description="正在查询…"
+          />
+          <a-empty
+            v-else-if="evidenceState === 'success'"
+            description="本次查询成功，暂无消费记录（触发一次流转后将产生 doc_status_changed 事件证据）"
+          />
+          <a-empty
+            v-else
+            description="尚未查询"
+          />
         </template>
       </a-table>
     </a-card>

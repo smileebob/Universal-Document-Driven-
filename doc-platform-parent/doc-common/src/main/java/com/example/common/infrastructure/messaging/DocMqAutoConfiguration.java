@@ -15,6 +15,8 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.core.annotation.Order;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Profile;
+import org.springframework.core.env.Environment;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.listener.RedisMessageListenerContainer;
 
@@ -50,41 +52,55 @@ public class DocMqAutoConfiguration {
 
     private static final Logger log = LoggerFactory.getLogger(DocMqAutoConfiguration.class);
 
-    /** mock 模式消息 Broker（缺省模式） */
+    /**
+     * 生产模式守卫：prod 必须 rocketmq 且配置接入点，禁止任何 mock 降级（ENV-02）。
+     */
     @Bean
+    @Profile("prod")
+    public DocMqProductionGuard docMqProductionGuard(DocMqProperties properties,
+                                                     Environment environment) {
+        return new DocMqProductionGuard(properties, environment);
+    }
+
+    /** mock 模式消息 Broker（缺省模式；prod 不装配，避免静默仿真） */
+    @Bean
+    @Profile("!prod")
     @ConditionalOnProperty(prefix = "doc.mq", name = "mode", havingValue = "mock", matchIfMissing = true)
     public InMemoryMessageBroker inMemoryMessageBroker(ObjectProvider<DocMessageListener> listeners) {
         return new InMemoryMessageBroker(listeners.orderedStream().toList());
     }
 
-    /** mock 模式发布器（缺省模式） */
+    /** mock 模式发布器（缺省模式；prod 不装配） */
     @Bean
     @Order(1)
+    @Profile("!prod")
     @ConditionalOnProperty(prefix = "doc.mq", name = "mode", havingValue = "mock", matchIfMissing = true)
     @ConditionalOnMissingBean(DocMessagePublisher.class)
     public DocMessagePublisher mockDocMessagePublisher(InMemoryMessageBroker broker,
                                                        ObjectProvider<MockMqRedisBridge> bridgeProvider) {
+        log.warn("[mq] 装配 mock 进程内消息仿真（仅限 dev/test；生产禁止）");
         // bridge may be absent in apps without spring-data-redis (e.g. WebFlux gateway): degrade to in-process
         return new MockDocMessagePublisher(broker, bridgeProvider.getIfAvailable());
     }
 
     /**
-     * 兜底回落：mode=rocketmq 但 RocketMQTemplate 缺失（name-server 未配置被
-     * RocketMqOptionalPostProcessor 排除官方装配，或应用未引入 rocketmq 依赖）
-     * 时，降级 mock 保启动不阻断。
+     * 开发兜底：mode=rocketmq 但 RocketMQTemplate 不可用时降级 mock 保启动。
+     * prod 下不装配，缺真实发布器将启动失败（DocMqProductionGuard/必需依赖）。
      */
     @Bean
     @Order(2)
+    @Profile("!prod")
     @ConditionalOnMissingBean(DocMessagePublisher.class)
     public DocMessagePublisher fallbackMockPublisher(ObjectProvider<DocMessageListener> listeners,
                                                      ObjectProvider<MockMqRedisBridge> bridge) {
-        log.warn("[mq] doc.mq.mode=rocketmq 但 RocketMQTemplate 不可用，降级 mock 进程内仿真");
+        log.warn("[mq] doc.mq.mode=rocketmq 但 RocketMQTemplate 不可用，降级 mock 进程内仿真（仅限 dev/test）");
         return new MockDocMessagePublisher(new InMemoryMessageBroker(listeners.orderedStream().toList()),
                 bridge.getIfAvailable());
     }
 
     /** 已注册监听器只读视图（诊断端点/测试用，mock 模式） */
     @Bean
+    @Profile("!prod")
     @ConditionalOnProperty(prefix = "doc.mq", name = "mode", havingValue = "mock", matchIfMissing = true)
     public MockMqInspector mockMqInspector(InMemoryMessageBroker broker) {
         return new MockMqInspector(broker);
@@ -121,6 +137,7 @@ public class DocMqAutoConfiguration {
 
         /** mock-mode Redis cross-instance bridge (degrades to in-process when template missing) */
         @Bean
+        @Profile("!prod")
         @ConditionalOnProperty(prefix = "doc.mq", name = "mode", havingValue = "mock", matchIfMissing = true)
         public MockMqRedisBridge mockMqRedisBridge(ObjectProvider<StringRedisTemplate> redisTemplateProvider,
                                                    InMemoryMessageBroker broker) {

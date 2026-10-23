@@ -20,23 +20,24 @@ import com.example.common.infrastructure.tablestore.model.TsColumnValue;
 import com.example.common.infrastructure.tablestore.model.TsPrimaryKey;
 import com.example.common.infrastructure.tablestore.model.TsRow;
 import com.example.common.infrastructure.tablestore.util.PartitionKeys;
+import com.example.runtime.domain.model.UniqueValues;
 import com.example.runtime.domain.port.EntityDataRepository;
 import com.example.runtime.domain.port.UniqueIndexStore;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
- * unique_index 孤儿行对账任务（design/03 §5.6 全量扫描 + 自动对账，
- * leader 阶段二补项裁决）。
+ * unique_index 孤儿行对账任务（design/03 §5.6 全量扫描 + 自动对账）。
  *
- * <p>孤儿定义：unique_index 占位行的 owner_uuid 指向的主行物理缺失
- * （新增占位后主行写入进程崩溃且回滚未执行）。对账策略（只删不增，
- * 安全幂等）：</p>
+ * <p>对账只处理可确认的失效占位，释放一律带属主条件（DATA-02）：</p>
  * <ul>
  *   <li>全量扫描 unique_index（GetRange 续翻）→ 属主主行反查
- *       （entity_data 优先，doc_data 兜底，两者同 {@code {code}_{hash4(uuid)}} 分区键模式）；</li>
+ *       （entity_data 优先，doc_data 兜底）；</li>
  *   <li>主行物理缺失且占位持续 &gt; 10 分钟（{@link #ORPHAN_FRESH_MILLIS}）→ 释放；
  *       新鲜窗口内跳过（容忍事务在途）；</li>
- *   <li>主行逻辑删（entity status∉{1,100} / doc deleted=1）且持续 &gt; 1 小时
- *       （{@link #DELETED_GRACE_MILLIS}，按主行 update_time 计）→ 释放；</li>
+ *   <li>主行逻辑删除：唯一占位<b>保留</b>（design/03 §5.6；删除后唯一值仍不可复用）；</li>
+ *   <li>主行有效：当前属性值仍等于占位值 → 保留；换值后遗留的旧占位 → 释放；</li>
  *   <li>每次释放同步写对账审计（audit_log 同目标分区键变体，operation=reconcile）。</li>
  * </ul>
  *
@@ -55,14 +56,12 @@ public class UniqueOrphanReconcileTask {
     /** 孤儿新鲜期阈值：主行物理缺失超过该时长才判定孤儿（容忍事务在途） */
     static final long ORPHAN_FRESH_MILLIS = TimeUnit.MINUTES.toMillis(10);
 
-    /** 逻辑删宽限阈值：主行逻辑删超过该时长后释放唯一占位 */
-    static final long DELETED_GRACE_MILLIS = TimeUnit.HOURS.toMillis(1);
-
     private static final Logger log = LoggerFactory.getLogger(UniqueOrphanReconcileTask.class);
 
     private final UniqueIndexStore uniqueIndexStore;
     private final EntityDataRepository dataRepository;
     private final TablestoreTemplate template;
+    private final ObjectMapper objectMapper;
     private final boolean scheduledEnabled;
 
     /** 并发防护：同一时刻仅一轮对账（手动触发冲突 40901，定时轮跳过） */
@@ -71,10 +70,12 @@ public class UniqueOrphanReconcileTask {
     public UniqueOrphanReconcileTask(UniqueIndexStore uniqueIndexStore,
                                      EntityDataRepository dataRepository,
                                      TablestoreTemplate template,
+                                     ObjectMapper objectMapper,
                                      @Value("${runtime.reconcile.unique-orphan.enabled:false}") boolean scheduledEnabled) {
         this.uniqueIndexStore = uniqueIndexStore;
         this.dataRepository = dataRepository;
         this.template = template;
+        this.objectMapper = objectMapper;
         this.scheduledEnabled = scheduledEnabled;
     }
 
@@ -135,6 +136,7 @@ public class UniqueOrphanReconcileTask {
         long released = 0;
         long skippedFresh = 0;
         long skippedActive = 0;
+        long skippedDeleted = 0;
         long errors = 0;
         long now = System.currentTimeMillis();
         for (TsRow row : template.getRange(TABLE_UNIQUE_INDEX)) {
@@ -148,6 +150,7 @@ public class UniqueOrphanReconcileTask {
                     }
                     case SKIP_FRESH -> skippedFresh++;
                     case SKIP_ACTIVE -> skippedActive++;
+                    case SKIP_DELETED -> skippedDeleted++;
                     default -> errors++;
                 }
             } catch (RuntimeException e) {
@@ -156,13 +159,15 @@ public class UniqueOrphanReconcileTask {
                         row.getPrimaryKey().get("partition_key"), e);
             }
         }
-        log.info("[reconcile] unique_index 对账完成: scanned={}, released={}, skippedFresh={}, skippedActive={}, errors={}",
-                scanned, released, skippedFresh, skippedActive, errors);
+        log.info("[reconcile] unique_index 对账完成: scanned={}, released={}, skippedFresh={}, "
+                        + "skippedActive={}, skippedDeleted={}, errors={}",
+                scanned, released, skippedFresh, skippedActive, skippedDeleted, errors);
         Map<String, Object> summary = new LinkedHashMap<>();
         summary.put("scanned", scanned);
         summary.put("released", released);
         summary.put("skipped_fresh", skippedFresh);
         summary.put("skipped_active", skippedActive);
+        summary.put("skipped_deleted", skippedDeleted);
         summary.put("errors", errors);
         return summary;
     }
@@ -186,33 +191,32 @@ public class UniqueOrphanReconcileTask {
             Long status = entityRow.get().getLong("status");
             boolean active = status != null && (status == 1L || status == 100L);
             if (active) {
-                return ReconcileDecision.SKIP_ACTIVE;
+                // 主行有效：仅当当前属性值已不再等于占位值（换值遗留）才释放
+                Boolean matches = valueMatches(entityRow.get(), codes[1], valueOf(row));
+                return Boolean.FALSE.equals(matches)
+                        ? ReconcileDecision.RELEASE : ReconcileDecision.SKIP_ACTIVE;
             }
-            // 逻辑删：按主行 update_time 计宽限期
-            long deletedAt = firstNonNull(entityRow.get().getLong("update_time"),
-                    entityRow.get().getLong("create_time"), 0L);
-            return now - deletedAt > DELETED_GRACE_MILLIS
-                    ? ReconcileDecision.RELEASE : ReconcileDecision.SKIP_FRESH;
+            // 逻辑删：占位按 design/03 §5.6 保留，删除后的唯一值不允许被复用
+            return ReconcileDecision.SKIP_DELETED;
         }
         if (docRow.isPresent()) {
             Long deleted = docRow.get().getLong("deleted");
             if (deleted == null || deleted != 1L) {
-                return ReconcileDecision.SKIP_ACTIVE;
+                Boolean matches = valueMatches(docRow.get(), codes[1], valueOf(row));
+                return Boolean.FALSE.equals(matches)
+                        ? ReconcileDecision.RELEASE : ReconcileDecision.SKIP_ACTIVE;
             }
-            long deletedAt = firstNonNull(docRow.get().getLong("update_time"),
-                    docRow.get().getLong("create_time"), 0L);
-            return now - deletedAt > DELETED_GRACE_MILLIS
-                    ? ReconcileDecision.RELEASE : ReconcileDecision.SKIP_FRESH;
+            return ReconcileDecision.SKIP_DELETED;
         }
         // 主行物理缺失：占位新鲜窗口内容忍（事务可能在途），超窗判定孤儿
         long age = now - firstNonNull(createTime, now, 0L);
         return age > ORPHAN_FRESH_MILLIS ? ReconcileDecision.RELEASE : ReconcileDecision.SKIP_FRESH;
     }
 
-    /** 释放占位 + 同目标分区同步审计（operation=reconcile） */
+    /** 释放占位 + 同目标分区同步审计（operation=reconcile；释放必须比对 owner） */
     private void release(TsRow row) {
         String partitionKey = String.valueOf(row.getPrimaryKey().get("partition_key"));
-        String value = String.valueOf(row.getPrimaryKey().get("unique_value"));
+        String value = valueOf(row);
         String owner = row.getString("owner_uuid");
         String[] codes = resolveTargetAndAttr(row, partitionKey);
         if (codes == null) {
@@ -221,9 +225,42 @@ public class UniqueOrphanReconcileTask {
         }
         String targetCode = codes[0];
         String attrCode = codes[1];
-        uniqueIndexStore.release(targetCode, attrCode, value);
+        if (!uniqueIndexStore.release(targetCode, attrCode, value, owner)) {
+            log.warn("[reconcile] 占位已易主或不存在，放弃释放: {}/{}/{}, owner={}",
+                    targetCode, attrCode, value, owner);
+            return;
+        }
         writeReconcileAudit(targetCode, owner, attrCode, value);
         log.info("[reconcile] 孤儿唯一占位已释放: {}/{}/{}, owner={}", targetCode, attrCode, value, owner);
+    }
+
+    /** 主键 unique_value 原文 */
+    private static String valueOf(TsRow row) {
+        return String.valueOf(row.getPrimaryKey().get("unique_value"));
+    }
+
+    /**
+     * 主行当前属性值是否仍等于占位值。
+     *
+     * @return true=一致；false=已换值；null=无法判定（缺列/解析失败，保守保留）
+     */
+    private Boolean valueMatches(TsRow mainRow, String attrCode, String placeholderValue) {
+        String json = mainRow.getString("attributes");
+        if (json == null || json.isBlank()) {
+            return null;
+        }
+        try {
+            JsonNode node = objectMapper.readTree(json).get(attrCode);
+            if (node == null || node.isNull()) {
+                return null;
+            }
+            Object value = node.isNumber() ? node.decimalValue()
+                    : node.isBoolean() ? node.booleanValue() : node.asText();
+            return UniqueValues.normalize(value).equals(placeholderValue);
+        } catch (JsonProcessingException e) {
+            log.warn("[reconcile] 主行 attributes 解析失败，保守保留占位: attr={}", attrCode);
+            return null;
+        }
     }
 
     /**
@@ -296,12 +333,14 @@ public class UniqueOrphanReconcileTask {
 
     /** 单行对账判定结果 */
     private enum ReconcileDecision {
-        /** 孤儿/超宽限期：释放占位 */
+        /** 可释放（物理孤儿 / 有效主行换值遗留） */
         RELEASE,
-        /** 新鲜窗口内（事务在途或逻辑删未超宽限）：跳过 */
+        /** 新鲜窗口内（事务在途）：跳过 */
         SKIP_FRESH,
-        /** 属主有效：跳过 */
+        /** 属主有效且值仍占用：跳过 */
         SKIP_ACTIVE,
+        /** 属主逻辑删除：占位保留（design/03 §5.6） */
+        SKIP_DELETED,
         /** 行结构异常：计错误跳过 */
         ERROR
     }

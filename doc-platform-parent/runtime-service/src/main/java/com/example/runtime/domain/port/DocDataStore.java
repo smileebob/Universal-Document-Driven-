@@ -46,18 +46,18 @@ public interface DocDataStore {
     void create(DocDataRecord record, String operator, String traceId);
 
     /**
-     * 可编辑态修改（current_status 快照 CAS + version 校验）。
+     * 可编辑态修改（version CAS：状态流转/删除同样递增 version，故版本条件同时覆盖
+     * 状态漂移与并发覆盖，TX-01）。
      *
-     * @param docCode           单据编码
-     * @param uuid              实例标识
-     * @param expectVersion     期望版本（乐观锁）
-     * @param expectStatus      读取快照 current_status（条件列）
-     * @param attributes        合并后属性
-     * @param relations         合并后 ref 关系
-     * @param updateTime        更新时间
+     * @param docCode       单据编码
+     * @param uuid          实例标识
+     * @param expectVersion 期望版本（乐观锁，落库条件比较）
+     * @param attributes    合并后属性
+     * @param relations     合并后 ref 关系
+     * @param updateTime    更新时间
      * @return false=条件冲突（调用方映射 40901）
      */
-    boolean updateEditable(String docCode, String uuid, long expectVersion, long expectStatus,
+    boolean updateEditable(String docCode, String uuid, long expectVersion,
                            Map<String, Object> attributes, List<Map<String, Object>> relations,
                            long updateTime);
 
@@ -81,17 +81,18 @@ public interface DocDataStore {
      * 流转写入集（单表局部事务原子提交主行 CAS；历史行 / outbox /
      * 同分区审计在事务提交后幂等补写，准最终一致）。
      *
-     * @param docCode     单据编码
-     * @param uuid        实例标识
-     * @param fromStatus  期望当前状态（T3 CAS 条件列）
-     * @param toStatus    目标状态
-     * @param operator    操作人
-     * @param event       事件名（如 submit/audit）
-     * @param sagaId      Saga 实例 ID（无 Saga 时传 null；写事件 payload）
+     * @param docCode         单据编码
+     * @param uuid            实例标识
+     * @param expectedVersion 规则/Saga 执行前读取的数据版本（快照版本，TX-02）
+     * @param fromStatus      期望当前状态（T3 CAS 条件列）
+     * @param toStatus        目标状态
+     * @param operator        操作人
+     * @param event           事件名（如 submit/audit）
+     * @param sagaId          Saga 实例 ID（无 Saga 时传 null；写事件 payload）
      * @return 流转结果（新版本号/历史 seq/outbox event_id）
      */
-    TransitionOutcome commitTransition(String docCode, String uuid, long fromStatus,
-                                       long toStatus, String operator, String event,
+    TransitionOutcome commitTransition(String docCode, String uuid, long expectedVersion,
+                                       long fromStatus, long toStatus, String operator, String event,
                                        String sagaId);
 
     /**

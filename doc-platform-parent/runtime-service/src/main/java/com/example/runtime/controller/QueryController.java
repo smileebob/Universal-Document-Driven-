@@ -5,6 +5,8 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.example.common.model.ApiResponse;
+import com.example.common.security.PlatformRoles;
+import com.example.common.security.RequireRoles;
 import com.example.runtime.domain.query.QueryDsl.QueryRequest;
 import com.example.runtime.domain.query.QueryDsl.QueryResult;
 import com.example.runtime.service.QueryService;
@@ -17,6 +19,8 @@ import com.example.runtime.service.QueryService;
  * PRD 11 §3.4：{@code {total, items, next_token, aggregations}}。</p>
  */
 @RestController
+@RequireRoles({PlatformRoles.PLATFORM_ADMIN, PlatformRoles.BUSINESS_ADMIN,
+        PlatformRoles.BUSINESS_USER})
 public class QueryController {
 
     private final QueryService queryService;

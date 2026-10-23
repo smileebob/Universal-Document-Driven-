@@ -168,19 +168,17 @@ public class TablestoreDocDataStore implements DocDataStore {
     // ==================== 可编辑态修改 / 逻辑删 ====================
 
     @Override
-    public boolean updateEditable(String docCode, String uuid, long expectVersion, long expectStatus,
+    public boolean updateEditable(String docCode, String uuid, long expectVersion,
                                   Map<String, Object> attributes, List<Map<String, Object>> relations,
                                   long updateTime) {
+        // version CAS（TX-01）：服务层快照与落库版本必须一致；状态流转/逻辑删除同样
+        // 递增 version，因此该条件同时覆盖“状态已漂移”和“并发属性修改”。
         List<ColumnUpdate> updates = List.of(
                 ColumnUpdate.put("attributes", TsColumnValue.of(toJson(attributes))),
                 ColumnUpdate.put("relations", TsColumnValue.of(toJson(relations))),
-                ColumnUpdate.put("version", TsColumnValue.of(expectVersion + 1)),
                 ColumnUpdate.put("update_time", TsColumnValue.of(updateTime)));
         try {
-            // current_status 快照 CAS：并发流转/修改改变状态即条件失败
-            template.updateRow(TABLE_DOC_DATA, dataPk(docCode, uuid), updates,
-                    RowCondition.expectExistAndColumnEq("current_status",
-                            TsColumnValue.of(expectStatus)));
+            template.updateWithVersion(TABLE_DOC_DATA, dataPk(docCode, uuid), expectVersion, updates);
             return true;
         } catch (TsConditionCheckException e) {
             return false;
@@ -189,9 +187,9 @@ public class TablestoreDocDataStore implements DocDataStore {
 
     @Override
     public boolean logicalDelete(String docCode, String uuid, long expectVersion, long updateTime) {
+        // updateWithVersion 自身写入 version+1，此处不得重复包含 version 列
         List<ColumnUpdate> updates = List.of(
                 ColumnUpdate.put("deleted", TsColumnValue.of(DocDataRecord.DELETED)),
-                ColumnUpdate.put("version", TsColumnValue.of(expectVersion + 1)),
                 ColumnUpdate.put("update_time", TsColumnValue.of(updateTime)));
         try {
             template.updateWithVersion(TABLE_DOC_DATA, dataPk(docCode, uuid), expectVersion, updates);
@@ -204,9 +202,9 @@ public class TablestoreDocDataStore implements DocDataStore {
     // ==================== 流转收口（单表事务 T1/T3 + 提交后幂等补写 T4/T5/审计） ====================
 
     @Override
-    public TransitionOutcome commitTransition(String docCode, String uuid, long fromStatus,
-                                              long toStatus, String operator, String event,
-                                              String sagaId) {
+    public TransitionOutcome commitTransition(String docCode, String uuid, long expectedVersion,
+                                              long fromStatus, long toStatus, String operator,
+                                              String event, String sagaId) {
         String partitionKey = PartitionKeys.dataKey(docCode, uuid);
         TsPrimaryKey mainPk = dataPk(docCode, uuid);
         long now = System.currentTimeMillis();
@@ -234,10 +232,16 @@ public class TablestoreDocDataStore implements DocDataStore {
                 throw new TsConditionCheckException("current_status 已变化: expect="
                         + fromStatus + ", actual=" + snapshotStatus);
             }
+            long snapshotVersion = main.getLong("version") == null
+                    ? 0L : main.getLong("version");
+            if (snapshotVersion != expectedVersion) {
+                // 快照版本漂移（规则/Saga 依据的旧数据被并发修改）→ 40901，TX-02
+                throw new TsConditionCheckException("version 已变化: expect="
+                        + expectedVersion + ", actual=" + snapshotVersion);
+            }
 
             // T3：主行双列 CAS（current_status 条件列 + version 列 put 新值）
-            long versionAfter = (main.getLong("version") == null
-                    ? 0L : main.getLong("version")) + 1;
+            long versionAfter = snapshotVersion + 1;
             List<ColumnUpdate> updates = List.of(
                     ColumnUpdate.put("current_status", TsColumnValue.of(toStatus)),
                     ColumnUpdate.put("version", TsColumnValue.of(versionAfter)),

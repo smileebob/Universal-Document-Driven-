@@ -96,8 +96,17 @@ class RoleCheckInterceptorTest {
     }
 
     @Test
-    @DisplayName("未携带角色头：dev 开关 false 放行 / true 拒绝")
+    @DisplayName("未携带角色头：默认拒绝；仅 dev demo 显式开关 false 时放行")
     void no_roles_header_follows_deny_switch() throws Exception {
+        // 默认配置必须拒绝（SEC-01）：生产不得因令牌缺少 roles 而绕过角色校验
+        RoleCheckProperties defaults = new RoleCheckProperties();
+        assertThat(defaults.isDenyUnauthenticated()).isTrue();
+        MockHttpServletResponse defaultResponse = new MockHttpServletResponse();
+        assertThat(new RoleCheckInterceptor(defaults).preHandle(
+                request(null), defaultResponse, handler("platformOnly"))).isFalse();
+        assertThat(defaultResponse.getStatus()).isEqualTo(403);
+
+        // dev demo 显式关闭拒绝（网关认证关闭场景）
         assertThat(interceptor(false).preHandle(
                 request(null), new MockHttpServletResponse(), handler("platformOnly"))).isTrue();
 

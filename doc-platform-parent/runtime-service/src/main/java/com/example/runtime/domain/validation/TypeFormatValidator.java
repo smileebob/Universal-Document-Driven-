@@ -15,6 +15,8 @@ import com.example.runtime.domain.model.FieldError;
  *
  * <ul>
  *   <li>STRING：必须为字符串，maxLength&gt;0 时长度不超限；</li>
+ *   <li>INTEGER：必须为数值且无小数部分；</li>
+ *   <li>DECIMAL：必须为数值，precision&gt;0 时小数位不超限；</li>
  *   <li>NUMBER：必须为数值（JSON number），拒绝字符串/布尔；</li>
  *   <li>BOOLEAN：必须为布尔；</li>
  *   <li>DATE：字符串 yyyy-MM-dd 可解析（透传存储）；</li>
@@ -57,6 +59,27 @@ public final class TypeFormatValidator implements AttributeValidator {
                 }
                 if (def.getMaxLength() > 0 && s.length() > def.getMaxLength()) {
                     return "「" + def.getName() + "」长度超出上限(" + def.getMaxLength() + ")";
+                }
+                return null;
+            }
+            case INTEGER: {
+                if (!(value instanceof Number) || value instanceof Boolean) {
+                    return "「" + def.getName() + "」须为整数";
+                }
+                java.math.BigDecimal number = new java.math.BigDecimal(value.toString());
+                if (number.stripTrailingZeros().scale() > 0) {
+                    return "「" + def.getName() + "」须为整数";
+                }
+                return null;
+            }
+            case DECIMAL: {
+                if (!(value instanceof Number) || value instanceof Boolean) {
+                    return "「" + def.getName() + "」须为数值";
+                }
+                java.math.BigDecimal number = new java.math.BigDecimal(value.toString());
+                if (def.getPrecision() > 0
+                        && number.stripTrailingZeros().scale() > def.getPrecision()) {
+                    return "「" + def.getName() + "」小数位超出上限(" + def.getPrecision() + ")";
                 }
                 return null;
             }
