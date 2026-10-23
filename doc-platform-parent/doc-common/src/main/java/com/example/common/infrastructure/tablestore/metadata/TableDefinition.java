@@ -37,6 +37,12 @@ public class TableDefinition {
     /** 备注 */
     private boolean localTxn = false;
 
+    /**
+     * 仅增量多元索引定义（V2+ 迁移用）：不重复建表，只把 searchIndexes
+     * 合并到已加载的同名基线表。用于在不修改已发布 V1 的前提下新增索引。
+     */
+    private boolean searchIndexOnly = false;
+
     private String comment;
 
     public String getName() {
@@ -101,6 +107,14 @@ public class TableDefinition {
 
     public void setLocalTxn(boolean localTxn) {
         this.localTxn = localTxn;
+    }
+
+    public boolean isSearchIndexOnly() {
+        return searchIndexOnly;
+    }
+
+    public void setSearchIndexOnly(boolean searchIndexOnly) {
+        this.searchIndexOnly = searchIndexOnly;
     }
 
     public String getComment() {

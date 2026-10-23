@@ -77,7 +77,7 @@ public class SagaStepHttpClient {
                         attempt + 1, connectRetries + 1, url, e.getMessage());
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                throw new StepInvocationException("步骤调用被中断: " + url, e, true);
+                throw new StepInvocationException("步骤调用被中断: " + url, e, true, true);
             } catch (IOException e) {
                 // 读超时等 IO 异常：按连接异常口径重试（连接建立后读超时多为对端慢，重试幂等步骤安全）
                 lastIoError = e;
@@ -85,30 +85,55 @@ public class SagaStepHttpClient {
                         attempt + 1, connectRetries + 1, url, e.getMessage());
             }
         }
+        boolean unknownResult = !(lastIoError instanceof ConnectException);
         throw new StepInvocationException("步骤调用失败（连接异常重试 "
                 + connectRetries + " 次后仍失败）: " + url + ", cause="
                 + (lastIoError == null ? "unknown" : lastIoError.getMessage()),
-                lastIoError, true);
+                lastIoError, true, unknownResult);
     }
 
     /** 步骤响应（statusCode + 原文；failed=非 2xx 语义位） */
     public record StepResponse(int statusCode, String body, boolean failed) {
+
+        /**
+         * 结果未知：5xx 可能已在参与方生效（读到超时/处理中失败），
+         * 不能按“未执行”跳过补偿。
+         */
+        public boolean unknownResult() {
+            return statusCode >= 500;
+        }
     }
 
-    /** 步骤调用异常（携带可重试语义位，供编排器死信归因） */
+    /** 步骤调用异常（携带连接失败/结果未知语义位，供编排器决定补偿） */
     public static class StepInvocationException extends RuntimeException {
 
         private static final long serialVersionUID = 1L;
 
         private final transient boolean connectFailure;
 
+        private final transient boolean unknownResult;
+
         public StepInvocationException(String message, Throwable cause, boolean connectFailure) {
+            this(message, cause, connectFailure, true);
+        }
+
+        public StepInvocationException(String message, Throwable cause, boolean connectFailure,
+                                       boolean unknownResult) {
             super(message, cause);
             this.connectFailure = connectFailure;
+            this.unknownResult = unknownResult;
         }
 
         public boolean isConnectFailure() {
             return connectFailure;
+        }
+
+        /**
+         * 调用超时/响应丢失时结果为未知（可能已执行），必须纳入补偿或人工核对；
+         * 连接建立失败可确认未发送。
+         */
+        public boolean isUnknownResult() {
+            return unknownResult;
         }
     }
 }

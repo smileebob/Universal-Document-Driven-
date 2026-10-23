@@ -1,8 +1,11 @@
 package com.example.runtime.service.event;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.Executor;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicLong;
@@ -19,6 +22,8 @@ import com.example.common.constants.DocMqConstants;
 import com.example.common.infrastructure.messaging.DocMessage;
 import com.example.common.infrastructure.messaging.DocMessagePublisher;
 import com.example.common.infrastructure.messaging.MessageMode;
+import com.example.runtime.domain.event.DeliveryCursorStore;
+import com.example.runtime.domain.event.DocDeliveryCursor;
 import com.example.runtime.domain.event.EventOutboxStore;
 import com.example.runtime.domain.event.OutboxEvent;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -30,75 +35,80 @@ import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 
 /**
- * Transactional Outbox 中继（EV-01/02，design/07 §四）：
- * <ol>
- *   <li>即时首发：事务提交后经 {@link #enqueue} 入内存队列，worker 线程
- *       （outbox-relay 池）异步投递；</li>
- *   <li>扫描兜底：5s 定时经 event_outbox_index（send_status=0 AND
- *       next_retry_time≤now，limit100 + next_token 续翻）兜底投递；</li>
- *   <li>CAS 抢占：next_retry_time 条件更新防多实例重发（抢占窗口 10min）；</li>
- *   <li>退避：5s/15s/45s/2min/5min/10min/30min/60min 八级，retry_count≥8
- *       转 send_status=2 待人工（手动重发接口 P-OP-03）。</li>
- * </ol>
+ * Transactional Outbox 中继（EV-01/02）。
  *
- * <p>消息体按 design/07 v1.1：body 即 event_body 列（含 event_id/event_type/
- * schema_version/timestamp/payload）；event_id/event_type/traceparent 写
- * userProperties。投递经 MQ 门面（doc.mq.mode mock/rocketmq 双模式防腐）。</p>
+ * <p><b>按单据顺序</b>：每个单据维护 {@code event_delivery_cursor}（last_sent_seq +
+ * 租约）。同一时刻只有持有租约的实例推进最早未确认 eventSeq；事件失败退避时
+ * 阻止后继越序；退避耗尽转待人工并阻断该单据序列。发送成功但 ACK/游标推进前
+ * 崩溃会重发同一 eventId，属于允许的 at-least-once。</p>
+ *
+ * <p>扫描仍用 event_outbox_index 发现候选，实际发送前用 event_outbox_seq_index
+ * 按 event_seq 升序重读并确认无缺口；多元索引最终一致导致候选暂时不可见时
+ * 只等待，不跳过。</p>
  */
 @Service
 public class OutboxRelayService {
 
-    /** 8 级退避序列毫秒（design/07 §四） */
     static final long[] BACKOFF_MS = {
             5_000L, 15_000L, 45_000L, 120_000L, 300_000L, 600_000L, 1_800_000L, 3_600_000L};
 
-    /** CAS 抢占窗口（now+10min，防多实例重发） */
     static final long CLAIM_WINDOW_MS = 600_000L;
+
+    static final long CURSOR_LEASE_MS = 60_000L;
 
     private static final Logger log = LoggerFactory.getLogger(OutboxRelayService.class);
 
     private final EventOutboxStore outboxStore;
+    private final DeliveryCursorStore cursorStore;
     private final DocMessagePublisher messagePublisher;
     private final Executor relayExecutor;
     private final ObjectMapper objectMapper;
 
-    /** 即时首发内存队列（进程内尽力而为，丢失由 5s 扫描兜底） */
     private final LinkedBlockingQueue<OutboxRef> immediateQueue = new LinkedBlockingQueue<>(1000);
-
-    /** 最近一轮扫描可见的待投递行数（send_status=0 且重试窗口已至；Gauge 源，design/11 §4.2 ddp_outbox_pending） */
     private final AtomicLong pendingGauge = new AtomicLong();
+    private final String instanceId = "relay-" + UUID.randomUUID().toString().substring(0, 8);
 
-    /** 中继投递计数（bindMetrics 后生效；测试手工构造为 null 不打点） */
     private Counter deliveredCounter;
     private Counter failedCounter;
     private Counter manualCounter;
 
-    public OutboxRelayService(EventOutboxStore outboxStore,
+    public OutboxRelayService(EventOutboxStore outboxStore, DeliveryCursorStore cursorStore,
                               DocMessagePublisher messagePublisher,
                               @Qualifier("outboxRelayExecutor") Executor relayExecutor,
                               ObjectMapper objectMapper) {
         this.outboxStore = outboxStore;
+        this.cursorStore = cursorStore;
         this.messagePublisher = messagePublisher;
         this.relayExecutor = relayExecutor;
         this.objectMapper = objectMapper;
     }
 
-    /** 即时投递引用（partition_key + event_id，worker 侧强一致重读） */
+    /** 即时投递引用（partition_key + event_id 兼容旧调用）。 */
     public record OutboxRef(String partitionKey, String eventId) {
     }
 
     // ==================== 即时首发 ====================
 
     /**
-     * 事务提交后即时首发入队（流转/建单服务在事务提交后调用）。
-     *
-     * @param partitionKey 分区键
-     * @param eventId      事件 ID
+     * 兼容旧调用：通过 eventId 定位事件后按单据顺序投递。
      */
     public void enqueue(String partitionKey, String eventId) {
-        OutboxRef ref = new OutboxRef(partitionKey, eventId);
+        OutboxEvent event = outboxStore.find(partitionKey, eventId).orElse(null);
+        if (event == null || event.getEventSeq() <= 0) {
+            log.debug("[outbox] 即时事件尚未投影或为旧行，交由扫描兜底: eventId={}", eventId);
+            return;
+        }
+        enqueueDoc(partitionKey, event.getTargetUuid());
+    }
+
+    /** 投影完成后按单据即时唤醒中继。 */
+    public void enqueueDoc(String partitionKey, String docUuid) {
+        if (docUuid == null || docUuid.isBlank()) {
+            return;
+        }
+        OutboxRef ref = new OutboxRef(partitionKey, docUuid);
         if (!immediateQueue.offer(ref)) {
-            log.warn("[outbox] 即时队列已满，交由扫描兜底: eventId={}", eventId);
+            log.warn("[outbox] 即时队列已满，交由扫描兜底: docUuid={}", docUuid);
             return;
         }
         Map<String, String> mdc = MDC.getCopyOfContextMap();
@@ -114,105 +124,182 @@ public class OutboxRelayService {
                 }
             });
         } catch (RuntimeException e) {
-            // 拒绝策略 CallerRuns 下理论不可达；防御性兜底（扫描会捡起）
-            log.warn("[outbox] 即时投递任务提交失败，扫描兜底: eventId={}", eventId);
+            log.warn("[outbox] 即时投递任务提交失败，扫描兜底: docUuid={}", docUuid);
         }
     }
 
-    /** 排空队列逐个投递（worker 主体） */
     private void drainOnce() {
         List<OutboxRef> batch = new ArrayList<>();
         immediateQueue.drainTo(batch, 50);
         for (OutboxRef ref : batch) {
             try {
-                deliverImmediate(ref);
+                deliverDoc(ref.partitionKey(), ref.eventId());
             } catch (RuntimeException e) {
-                log.warn("[outbox] 即时投递异常，扫描兜底: eventId={}, cause={}",
+                log.warn("[outbox] 即时投递异常，扫描兜底: docUuid={}, cause={}",
                         ref.eventId(), e.getMessage());
             }
         }
     }
 
-    /** 即时投递：主键强一致重读 → CAS 抢占 → 发送（抢占失败/已发送直接跳过） */
-    private void deliverImmediate(OutboxRef ref) {
-        OutboxEvent event = outboxStore.find(ref.partitionKey(), ref.eventId()).orElse(null);
-        if (event == null || event.getSendStatus() != 0L) {
-            return;
-        }
-        long now = System.currentTimeMillis();
-        if (event.getNextRetryTime() > now) {
-            // 已被抢占或退避窗口未至
-            return;
-        }
-        if (!outboxStore.casClaim(event, event.getNextRetryTime(), now + CLAIM_WINDOW_MS)) {
-            return;
-        }
-        event.setNextRetryTime(now + CLAIM_WINDOW_MS);
-        deliver(event);
-    }
+    // ==================== 扫描兜底 ====================
 
-    // ==================== 5s 扫描兜底 ====================
-
-    /**
-     * 定时扫描兜底（每 5s）：event_outbox_index 检索 send_status=0 AND
-     * next_retry_time≤now，limit100 + next_token 续翻至尽；逐行 CAS 抢占后投递。
-     */
     @Scheduled(fixedDelayString = "${doc.runtime.outbox.scan-interval-ms:5000}",
             initialDelayString = "${doc.runtime.outbox.scan-initial-delay-ms:10000}")
     public void scanAndDeliver() {
         String token = null;
         int total = 0;
         int seenPending = 0;
+        Set<String> docs = new LinkedHashSet<>();
         do {
             long now = System.currentTimeMillis();
             EventOutboxStore.ScanPage page = outboxStore.scanPending(now, 100, token);
             seenPending += page.events().size();
             for (OutboxEvent event : page.events()) {
-                try {
-                    if (outboxStore.casClaim(event, event.getNextRetryTime(),
-                            now + CLAIM_WINDOW_MS)) {
-                        event.setNextRetryTime(now + CLAIM_WINDOW_MS);
-                        deliver(event);
-                        total++;
-                    }
-                } catch (RuntimeException e) {
-                    log.warn("[outbox] 扫描投递异常: eventId={}, cause={}",
-                            event.getEventId(), e.getMessage());
+                if (event.getTargetUuid() != null) {
+                    docs.add(event.getPartitionKey() + "\u0000" + event.getTargetUuid());
                 }
             }
             token = page.nextToken();
         } while (token != null && !token.isEmpty());
+        for (String doc : docs) {
+            int split = doc.indexOf('\u0000');
+            try {
+                if (deliverDoc(doc.substring(0, split), doc.substring(split + 1))) {
+                    total++;
+                }
+            } catch (RuntimeException e) {
+                log.warn("[outbox] 扫描投递异常: doc={}, cause={}",
+                        doc.substring(split + 1), e.getMessage());
+            }
+        }
         pendingGauge.set(seenPending);
         if (total > 0) {
-            log.info("[outbox] 扫描兜底投递完成: count={}", total);
+            log.info("[outbox] 扫描兜底投递完成: docs={}", total);
         }
     }
 
-    // ==================== 投递与退避 ====================
+    // ==================== 按单据顺序投递 ====================
+
+    /**
+     * 投递一个单据的连续事件序列。
+     *
+     * @return true=至少推进了一条事件
+     */
+    boolean deliverDoc(String partitionKey, String docUuid) {
+        DocDeliveryCursor cursor = cursorStore.getOrCreate(partitionKey, docUuid);
+        long now = System.currentTimeMillis();
+        if (cursor.blocked()) {
+            log.error("[outbox][ALERT] 单据事件序列已被死信阻断，需人工处理: docUuid={}, seq={}, reason={}",
+                    docUuid, cursor.getBlockedEventSeq(), cursor.getBlockedReason());
+            return false;
+        }
+        if (cursor.getLeaseUntil() > now && cursor.getLeaseOwner() != null
+                && !cursor.getLeaseOwner().isBlank()) {
+            return false;
+        }
+        if (!cursorStore.claim(cursor, instanceId, now + CURSOR_LEASE_MS)) {
+            return false;
+        }
+        boolean advanced = false;
+        try {
+            while (true) {
+                List<OutboxEvent> events = outboxStore.scanByDocAfterSeq(
+                        docUuid, cursor.getLastSentSeq(), 100);
+                if (events.isEmpty()) {
+                    return advanced;
+                }
+                boolean progressed = false;
+                for (OutboxEvent event : events) {
+                    long seq = event.getEventSeq();
+                    if (seq <= cursor.getLastSentSeq()) {
+                        continue;
+                    }
+                    if (event.getSendStatus() == 2L) {
+                        cursorStore.block(cursor, seq,
+                                "事件已转待人工: " + event.getEventId(), instanceId);
+                        log.error("[outbox][ALERT] 发现待人工事件，阻断单据序列: docUuid={}, seq={}",
+                                docUuid, seq);
+                        return advanced;
+                    }
+                    if (event.getSendStatus() == 1L) {
+                        if (!cursorStore.advance(cursor, seq, instanceId)) {
+                            return advanced;
+                        }
+                        advanced = true;
+                        progressed = true;
+                        continue;
+                    }
+                    long expected = cursor.getLastSentSeq() + 1;
+                    if (seq > expected) {
+                        // 更早事件尚未被索引可见：等待，绝不越序
+                        log.warn("[outbox] 事件序列存在缺口，等待前驱可见: docUuid={}, expected={}, actual={}",
+                                docUuid, expected, seq);
+                        return advanced;
+                    }
+                    if (event.getPreviousEventSeq() > 0
+                            && event.getPreviousEventSeq() != cursor.getLastSentSeq()) {
+                        log.warn("[outbox] previous_event_seq 与 checkpoint 不一致，等待人工核对: "
+                                        + "docUuid={}, seq={}, previous={}, checkpoint={}",
+                                docUuid, seq, event.getPreviousEventSeq(),
+                                cursor.getLastSentSeq());
+                        return advanced;
+                    }
+                    long current = System.currentTimeMillis();
+                    if (event.getNextRetryTime() > current) {
+                        return advanced;
+                    }
+                    if (!outboxStore.casClaim(event, event.getNextRetryTime(),
+                            current + CLAIM_WINDOW_MS)) {
+                        return advanced;
+                    }
+                    event.setNextRetryTime(current + CLAIM_WINDOW_MS);
+                    if (!deliver(event, cursor)) {
+                        return advanced;
+                    }
+                    if (!cursorStore.advance(cursor, seq, instanceId)) {
+                        log.warn("[outbox] checkpoint 推进竞争失败（下一轮从已发送行补齐）: docUuid={}, seq={}",
+                                docUuid, seq);
+                        return advanced;
+                    }
+                    advanced = true;
+                    progressed = true;
+                }
+                if (!progressed) {
+                    return advanced;
+                }
+            }
+        } finally {
+            if (instanceId.equals(cursor.getLeaseOwner())) {
+                cursorStore.release(cursor, instanceId);
+            }
+        }
+    }
 
     /**
      * 单事件投递：成功 markSent；失败按 8 级退避 markRetry，
-     * retry_count≥8 转 send_status=2 待人工。
+     * retry_count≥8 转 send_status=2 并阻断该单据序列。
      */
-    void deliver(OutboxEvent event) {
+    private boolean deliver(OutboxEvent event, DocDeliveryCursor cursor) {
         try {
             DocMessage message = toMessage(event);
             boolean sent = messagePublisher.publish(message);
             if (sent) {
                 outboxStore.markSent(event);
                 increment(deliveredCounter);
-                log.info("[outbox] 事件投递成功: eventId={}, type={}, mode={}",
-                        event.getEventId(), event.getEventType(), messagePublisher.mode());
-            } else {
-                failWithBackoff(event, "publisher 返回 false（broker 不可用）");
+                log.info("[outbox] 事件投递成功: eventId={}, seq={}, type={}, mode={}",
+                        event.getEventId(), event.getEventSeq(), event.getEventType(),
+                        messagePublisher.mode());
+                return true;
             }
+            failWithBackoff(event, "publisher 返回 false（broker 不可用）", cursor);
+            return false;
         } catch (RuntimeException e) {
-            failWithBackoff(event, e.getMessage());
+            failWithBackoff(event, e.getMessage(), cursor);
+            return false;
         }
     }
 
-    /** 失败退避推进（retry_count 基于行当前值 +1） */
-    private void failWithBackoff(OutboxEvent event, String reason) {
+    private void failWithBackoff(OutboxEvent event, String reason, DocDeliveryCursor cursor) {
         long retryCount = event.getRetryCount();
         boolean toManual = retryCount + 1 >= BACKOFF_MS.length;
         long backoff = BACKOFF_MS[(int) Math.min(retryCount, BACKOFF_MS.length - 1)];
@@ -220,11 +307,14 @@ public class OutboxRelayService {
         outboxStore.markRetry(event, nextRetry, reason, toManual);
         increment(toManual ? manualCounter : failedCounter);
         if (toManual) {
-            log.error("[outbox][ALERT] 事件投递退避耗尽转待人工: eventId={}, type={}, lastError={}",
-                    event.getEventId(), event.getEventType(), reason);
+            cursorStore.block(cursor, event.getEventSeq(),
+                    "事件投递退避耗尽: " + event.getEventId() + ", " + reason, instanceId);
+            log.error("[outbox][ALERT] 事件投递退避耗尽转待人工并阻断单据序列: "
+                            + "eventId={}, docUuid={}, seq={}, lastError={}",
+                    event.getEventId(), event.getTargetUuid(), event.getEventSeq(), reason);
         } else {
-            log.warn("[outbox] 事件投递失败退避: eventId={}, retry={}, nextInMs={}, cause={}",
-                    event.getEventId(), retryCount + 1, backoff, reason);
+            log.warn("[outbox] 事件投递失败退避: eventId={}, seq={}, retry={}, nextInMs={}, cause={}",
+                    event.getEventId(), event.getEventSeq(), retryCount + 1, backoff, reason);
         }
     }
 
@@ -237,7 +327,6 @@ public class OutboxRelayService {
             topic = DocMqConstants.Topics.ENTITY_CHANGE_EVENTS;
             mode = MessageMode.NORMAL;
         } else {
-            // DOC_STATUS_CHANGED / DOC_CREATED：FIFO（Sharding Key = doc_uuid）
             topic = DocMqConstants.Topics.DOC_STATUS_EVENTS;
             mode = MessageMode.ORDERLY;
             shardingKey = event.getTargetUuid();
@@ -247,6 +336,9 @@ public class OutboxRelayService {
                 body, mode)
                 .withUserProperty("event_id", event.getEventId())
                 .withUserProperty("event_type", event.getEventType());
+        if (event.getEventSeq() > 0) {
+            message.withUserProperty("event_seq", String.valueOf(event.getEventSeq()));
+        }
         String traceparent = extractTraceparent(body);
         if (traceparent != null) {
             message.withUserProperty("traceparent", traceparent);
@@ -254,7 +346,6 @@ public class OutboxRelayService {
         return message;
     }
 
-    /** 从事件体提取 traceparent（v1.1 信封 user_properties.traceparent，无则 null） */
     private String extractTraceparent(String body) {
         try {
             JsonNode node = objectMapper.readTree(body);
@@ -272,20 +363,12 @@ public class OutboxRelayService {
         return null;
     }
 
-    /** 即时队列当前深度（监控/测试用） */
     public int immediateQueueDepth() {
         return immediateQueue.size();
     }
 
-    // ==================== 可观测性（design/11 §4.2 / 任务 #20） ====================
+    // ==================== 可观测性 ====================
 
-    /**
-     * 绑定 Outbox 指标：{@code ddp_outbox_pending}（Gauge，最近扫描可见待投递行数
-     * + 即时队列深度）、{@code ddp_outbox_relay_total{result=delivered|failed|manual}}。
-     * Setter 注入（required=false）：无 actuator/测试手工构造场景不打点。
-     *
-     * @param registry Micrometer 注册表
-     */
     @Autowired(required = false)
     public void bindMetrics(MeterRegistry registry) {
         if (registry == null) {
@@ -303,7 +386,6 @@ public class OutboxRelayService {
                 .tag("result", "manual").register(registry);
     }
 
-    /** 计数器空安全自增（未绑定 metrics 时 NOOP） */
     private static void increment(Counter counter) {
         if (counter != null) {
             counter.increment();

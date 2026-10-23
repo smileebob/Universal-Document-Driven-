@@ -71,6 +71,11 @@ class SagaOrchestratorTest {
 
     /** 步骤端点响应路由：按 url 命中失败集合返回 500 failed，其余 200 */
     private void stubEndpoints(String... failedUrls) {
+        stubEndpointsWithStatus(500, failedUrls);
+    }
+
+    /** 指定失败状态码：4xx=明确拒绝；5xx=结果未知（可能已生效） */
+    private void stubEndpointsWithStatus(int failureStatus, String... failedUrls) {
         List<String> failed = List.of(failedUrls);
         List<String> callOrder = new ArrayList<>();
         when(stepClient.post(anyString(), anyString(), any(TxPlan.TxStep.class), anyString()))
@@ -78,7 +83,7 @@ class SagaOrchestratorTest {
                     String url = invocation.getArgument(0);
                     callOrder.add(url);
                     return failed.contains(url)
-                            ? new StepResponse(500, "{\"error\":\"injected\"}", true)
+                            ? new StepResponse(failureStatus, "{\"error\":\"injected\"}", true)
                             : new StepResponse(200, "{\"ok\":true}", false);
                 });
     }
@@ -113,7 +118,8 @@ class SagaOrchestratorTest {
     @Test
     @DisplayName("APS 失败 → SAP 逆序冲正 → COMPENSATED，单据不改状态（TX-02 验收场景）")
     void apsFailed_sapCompensated_reverseOrder() {
-        stubEndpoints(APS_ACTION);
+        // 4xx 表示明确拒绝（未生效），失败步本身无需冲正
+        stubEndpointsWithStatus(400, APS_ACTION);
 
         assertThatThrownBy(() -> orchestrator.execute(plan(), DOC, UUID, 1L, 100L, 10L,
                 "alice", "key-compensate-1"))
@@ -135,7 +141,8 @@ class SagaOrchestratorTest {
     @Test
     @DisplayName("冲正失败 → DEAD + saga_dead_letter 落表 + ERROR 告警（TX-03）")
     void compensateFailed_deadLetterPersisted() {
-        stubEndpoints(APS_ACTION, SAP_COMPENSATE);
+        // 4xx 冲正拒绝 = 明确失败 → DEAD
+        stubEndpointsWithStatus(400, APS_ACTION, SAP_COMPENSATE);
 
         assertThatThrownBy(() -> orchestrator.execute(plan(), DOC, UUID, 1L, 100L, 10L,
                 "alice", "key-dead-1"))
@@ -146,6 +153,42 @@ class SagaOrchestratorTest {
         assertThat(sagaStore.countDeadLetters(null)).isEqualTo(1);
         assertThat(sagaStore.findDeadLetter(sagaId)).isPresent();
         assertThat(sagaStore.findDeadLetter(sagaId).orElseThrow().getFailedStepSeq()).isEqualTo(2L);
+    }
+
+    @Test
+    @DisplayName("5xx 正向结果未知 → 失败步也纳入补偿；补偿仍未知 → MANUAL_REQUIRED")
+    void unknownActionAndCompensation_manualRequired() {
+        stubEndpointsWithStatus(500, APS_ACTION, APS_COMPENSATE);
+
+        assertThatThrownBy(() -> orchestrator.execute(plan(), DOC, UUID, 1L, 100L, 10L,
+                "alice", "key-unknown-1"))
+                .isInstanceOf(SagaDeadException.class)
+                .extracting(e -> ((SagaDeadException) e).getStatus())
+                .isEqualTo(SagaStatus.MANUAL_REQUIRED);
+
+        String sagaId = SagaOrchestrator.deriveSagaId("key-unknown-1", UUID, 10L);
+        assertThat(sagaStore.find(sagaId).orElseThrow().getStatus())
+                .isEqualTo(SagaStatus.MANUAL_REQUIRED);
+        assertThat(sagaStore.findDeadLetter(sagaId)).isPresent();
+        // 未知的失败步被纳入补偿（而不是当作未执行跳过）
+        verify(stepClient).post(org.mockito.ArgumentMatchers.eq(APS_COMPENSATE),
+                anyString(), any(TxPlan.TxStep.class), anyString());
+    }
+
+    @Test
+    @DisplayName("补偿预算独立：正向失败后补偿预算耗尽 → MANUAL_REQUIRED，不显示已回滚")
+    void compensationBudgetExhausted_manualRequired() {
+        SagaProperties props = new SagaProperties();
+        props.setCompensationBudgetMs(-1L);
+        SagaOrchestrator budgeted = new SagaOrchestrator(sagaStore, stepClient,
+                props, new ObjectMapper());
+        stubEndpointsWithStatus(400, APS_ACTION);
+
+        assertThatThrownBy(() -> budgeted.execute(plan(), DOC, UUID, 1L, 100L, 10L,
+                "alice", "key-budget-1"))
+                .isInstanceOf(SagaDeadException.class)
+                .extracting(e -> ((SagaDeadException) e).getStatus())
+                .isEqualTo(SagaStatus.MANUAL_REQUIRED);
     }
 
     @Test

@@ -30,10 +30,12 @@ class DefinitionAndCommonTest {
     // ==================== V1 定义文件 ====================
 
     @Test
-    @DisplayName("V1__base-tables.json：16 张表、TTL、hash 位数、索引与 Nested 预留点")
+    @DisplayName("V1+V2 定义：18 张表、TTL、hash 位数、增量索引与 Nested 预留点")
     void v1Definitions() {
         List<TableDefinition> tables = new TablestoreDefinitionLoader().loadAll();
-        assertThat(tables).hasSize(16);
+        assertThat(tables).hasSize(18);
+        assertThat(tables).extracting(TableDefinition::getName)
+                .contains("event_delivery_cursor", "index_publish_task");
 
         // audit_log：hash6 + 无 TTL（原 400 天，因 OTS「TTL 索引要求基表禁更新」与多元索引不可兼得，改清理/归档任务兜底）
         TableDefinition auditLog = byName(tables, "audit_log");
@@ -46,7 +48,8 @@ class DefinitionAndCommonTest {
         TableDefinition outbox = byName(tables, "event_outbox");
         assertThat(outbox.getHashLength()).isEqualTo(4);
         assertThat(outbox.getTtlSeconds()).isEqualTo(TableDefinition.TTL_FOREVER);
-        assertThat(outbox.getSearchIndexes()).extracting("name").containsExactly("event_outbox_index");
+        assertThat(outbox.getSearchIndexes()).extracting("name")
+                .contains("event_outbox_index", "event_outbox_seq_index");
 
         // idempotent_record：hash4 + TTL 24h
         assertThat(byName(tables, "idempotent_record").getTtlSeconds()).isEqualTo(86400L);

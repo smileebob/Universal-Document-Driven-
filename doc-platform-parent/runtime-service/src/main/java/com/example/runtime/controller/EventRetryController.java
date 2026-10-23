@@ -17,6 +17,8 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.common.exception.BizException;
 import com.example.common.exception.ErrorCode;
 import com.example.common.model.ApiResponse;
+import com.example.runtime.domain.event.DeliveryCursorStore;
+import com.example.runtime.domain.event.DocDeliveryCursor;
 import com.example.runtime.domain.event.EventOutboxStore;
 import com.example.runtime.domain.event.OutboxEvent;
 import com.example.runtime.service.event.DocStatusEventConsumeService;
@@ -36,13 +38,15 @@ import com.example.runtime.service.event.OutboxRelayService;
 public class EventRetryController {
 
     private final EventOutboxStore outboxStore;
+    private final DeliveryCursorStore cursorStore;
     private final OutboxRelayService relayService;
     private final DocStatusEventConsumeService consumeService;
 
-    public EventRetryController(EventOutboxStore outboxStore,
+    public EventRetryController(EventOutboxStore outboxStore, DeliveryCursorStore cursorStore,
                                 OutboxRelayService relayService,
                                 DocStatusEventConsumeService consumeService) {
         this.outboxStore = outboxStore;
+        this.cursorStore = cursorStore;
         this.relayService = relayService;
         this.consumeService = consumeService;
     }
@@ -79,9 +83,17 @@ public class EventRetryController {
         }
         long now = System.currentTimeMillis();
         outboxStore.resetForResend(event, now);
+        // 只有重发被阻断的最早事件才解除序列阻断；重发后继事件不得越序
+        DocDeliveryCursor cursor = cursorStore.find(event.getPartitionKey(),
+                event.getTargetUuid()).orElse(null);
+        if (cursor != null && cursor.blocked()
+                && event.getEventSeq() <= cursor.getBlockedEventSeq()) {
+            cursorStore.unblock(event.getPartitionKey(), event.getTargetUuid());
+        }
         relayService.enqueue(event.getPartitionKey(), event.getEventId());
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("event_id", eventId);
+        data.put("event_seq", event.getEventSeq());
         data.put("accepted", true);
         return ApiResponse.ok(data);
     }
@@ -108,6 +120,8 @@ public class EventRetryController {
         view.put("event_type", event.getEventType());
         view.put("target_code", event.getTargetCode());
         view.put("target_uuid", event.getTargetUuid());
+        view.put("event_seq", event.getEventSeq());
+        view.put("previous_event_seq", event.getPreviousEventSeq());
         view.put("send_status", event.getSendStatus());
         view.put("retry_count", event.getRetryCount());
         view.put("last_error", event.getLastError());

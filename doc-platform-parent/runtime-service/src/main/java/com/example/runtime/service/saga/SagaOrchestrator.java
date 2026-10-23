@@ -48,6 +48,15 @@ public class SagaOrchestrator {
     /** 步骤日志阶段：冲正 */
     static final String PHASE_COMPENSATE = "compensate";
 
+    /** 步骤结果：成功 */
+    static final String RESULT_SUCCESS = "SUCCESS";
+
+    /** 步骤结果：明确未执行/被拒绝 */
+    static final String RESULT_REJECTED = "REJECTED";
+
+    /** 步骤结果：超时/响应丢失，可能已执行 */
+    static final String RESULT_UNKNOWN = "UNKNOWN";
+
     private final SagaStore sagaStore;
     private final SagaStepHttpClient stepClient;
     private final SagaProperties properties;
@@ -128,13 +137,24 @@ public class SagaOrchestrator {
 
         private final String sagaId;
 
+        private final SagaStatus status;
+
         public SagaDeadException(String sagaId, String reason) {
+            this(sagaId, reason, SagaStatus.DEAD);
+        }
+
+        public SagaDeadException(String sagaId, String reason, SagaStatus status) {
             super(reason);
             this.sagaId = sagaId;
+            this.status = status;
         }
 
         public String getSagaId() {
             return sagaId;
+        }
+
+        public SagaStatus getStatus() {
+            return status;
         }
     }
 
@@ -199,7 +219,7 @@ public class SagaOrchestrator {
 
         List<Map<String, Object>> logs = new ArrayList<>();
         long startMs = now;
-        runForward(execution, plan, logs, 1, startMs);
+        runForward(execution, plan, logs, 1, startMs, properties.getForwardBudgetMs());
         return new SagaResult(sagaId, execution.getStatus());
     }
 
@@ -213,23 +233,24 @@ public class SagaOrchestrator {
 
     // ==================== 正向执行 ====================
 
-    /** 正向按 seq 执行（预算检查 + 失败转冲正），成功置 COMPLETED */
+    /** 正向按 seq 执行（独立正向预算 + 失败转冲正），成功置 ACTIONS_SUCCEEDED。 */
     private void runForward(SagaExecution execution, TxPlan plan,
-                            List<Map<String, Object>> logs, int fromSeq, long startMs) {
+                            List<Map<String, Object>> logs, int fromSeq, long startMs,
+                            long budgetMs) {
         List<TxPlan.TxStep> steps = plan.steps();
         boolean allOk = true;
         String failReason = null;
         long failedSeq = 0L;
+        boolean compensateFailedStep = false;
         for (TxPlan.TxStep step : steps) {
             if (step.seq() < fromSeq) {
                 continue;
             }
-            if (System.currentTimeMillis() - startMs > properties.getTotalBudgetMs()) {
+            if (System.currentTimeMillis() - startMs > budgetMs) {
                 allOk = false;
-                failReason = "Saga 总预算耗尽（>" + properties.getTotalBudgetMs() + "ms）: step="
-                        + step.name();
+                failReason = "Saga 正向预算耗尽（>" + budgetMs + "ms）: step=" + step.name();
                 failedSeq = step.seq();
-                appendLog(logs, step.seq(), PHASE_ACTION, false, failReason);
+                appendLog(logs, step.seq(), PHASE_ACTION, RESULT_REJECTED, failReason);
                 break;
             }
             execution.setCurrentStepSeq(step.seq());
@@ -240,19 +261,25 @@ public class SagaOrchestrator {
                 StepResponse response = stepClient.post(step.actionUrl(),
                         stepPayload(execution, step, PHASE_ACTION), step, execution.getSagaId());
                 if (response.failed()) {
+                    boolean unknown = response.unknownResult();
                     allOk = false;
-                    failReason = "步骤正向执行被拒绝: step=" + step.name()
-                            + ", http=" + response.statusCode();
+                    failReason = "步骤正向执行" + (unknown ? "结果未知" : "被拒绝")
+                            + ": step=" + step.name() + ", http=" + response.statusCode();
                     failedSeq = step.seq();
-                    appendLog(logs, step.seq(), PHASE_ACTION, false, failReason);
+                    compensateFailedStep = unknown;
+                    appendLog(logs, step.seq(), PHASE_ACTION,
+                            unknown ? RESULT_UNKNOWN : RESULT_REJECTED, failReason);
                     break;
                 }
-                appendLog(logs, step.seq(), PHASE_ACTION, true, null);
+                appendLog(logs, step.seq(), PHASE_ACTION, RESULT_SUCCESS, null);
             } catch (StepInvocationException e) {
+                boolean unknown = e.isUnknownResult();
                 allOk = false;
                 failReason = e.getMessage();
                 failedSeq = step.seq();
-                appendLog(logs, step.seq(), PHASE_ACTION, false, failReason);
+                compensateFailedStep = unknown;
+                appendLog(logs, step.seq(), PHASE_ACTION,
+                        unknown ? RESULT_UNKNOWN : RESULT_REJECTED, failReason);
                 break;
             }
         }
@@ -267,45 +294,58 @@ public class SagaOrchestrator {
                     execution.getSagaId(), steps.size());
             return;
         }
-        // 正向失败：逆序冲正已成功步骤（seq < failedSeq 的全部成功步 + 失败步本身不冲正）
-        compensate(execution, plan, logs, failedSeq, failReason, startMs);
+        // 正向失败：逆序冲正已成功步骤；超时/5xx 的失败步可能已生效，一并冲正
+        compensate(execution, plan, logs, failedSeq, failReason, compensateFailedStep,
+                System.currentTimeMillis());
     }
 
     // ==================== 逆序冲正 ====================
 
     /**
-     * 逆序冲正（seq 降序，仅冲正「正向已成功」的步骤；compensateUrl 为空的步骤跳过）。
-     * 全部成功 → COMPENSATED（抛 SagaCompensatedException）；
-     * 任一失败 → DEAD + 死信（抛 SagaDeadException）。
+     * 逆序冲正（seq 降序）。默认只冲正已成功步骤；若失败步结果未知
+     * （超时/5xx）则一并冲正。补偿使用独立预算，超时/未知转人工而非假装回滚。
+     * 全部成功 → COMPENSATED；明确拒绝 → DEAD；未知 → MANUAL_REQUIRED。
      */
     private void compensate(SagaExecution execution, TxPlan plan,
                             List<Map<String, Object>> logs, long failedSeq,
-                            String failReason, long startMs) {
+                            String failReason, boolean compensateFailedStep, long startMs) {
         execution.setStatus(SagaStatus.COMPENSATING);
         execution.setStepLogs(toJson(logs));
         execution.setUpdateTime(System.currentTimeMillis());
         sagaStore.update(execution);
-        log.warn("[saga] 正向失败转冲正: sagaId={}, failedSeq={}, reason={}",
-                execution.getSagaId(), failedSeq, failReason);
+        log.warn("[saga] 转冲正: sagaId={}, failedSeq={}, compensateFailedStep={}, reason={}",
+                execution.getSagaId(), failedSeq, compensateFailedStep, failReason);
 
+        long budgetMs = properties.getCompensationBudgetMs();
         List<TxPlan.TxStep> reversed = new ArrayList<>(plan.steps());
         reversed.sort(Comparator.comparingInt(TxPlan.TxStep::seq).reversed());
         List<Map<String, Object>> compensateResponses = new ArrayList<>();
         for (TxPlan.TxStep step : reversed) {
-            if (step.seq() >= failedSeq) {
-                // 失败步及未执行步无需冲正
+            if (step.seq() > failedSeq
+                    || (step.seq() == failedSeq && !compensateFailedStep)) {
                 continue;
             }
-            if (!actionSucceeded(logs, step.seq())) {
+            boolean succeeded = actionSucceeded(logs, step.seq());
+            boolean unknown = actionUnknown(logs, step.seq());
+            if (!succeeded && !(unknown && step.seq() == failedSeq)) {
+                continue;
+            }
+            if (compensateSucceeded(logs, step.seq())) {
                 continue;
             }
             if (step.compensateUrl() == null || step.compensateUrl().isBlank()) {
-                appendLog(logs, step.seq(), PHASE_COMPENSATE, true, "no-compensate-endpoint");
+                if (unknown && step.seq() == failedSeq) {
+                    markManual(execution, plan, logs, failedSeq, failReason,
+                            "结果未知步骤缺少补偿端点: step=" + step.name(), compensateResponses);
+                    return;
+                }
+                appendLog(logs, step.seq(), PHASE_COMPENSATE, RESULT_REJECTED,
+                        "no-compensate-endpoint");
                 continue;
             }
-            if (System.currentTimeMillis() - startMs > properties.getTotalBudgetMs()) {
-                deadLetter(execution, plan, logs, failedSeq, failReason,
-                        "冲正阶段预算耗尽: step=" + step.name(), compensateResponses);
+            if (System.currentTimeMillis() - startMs > budgetMs) {
+                markManual(execution, plan, logs, failedSeq, failReason,
+                        "补偿预算耗尽: step=" + step.name(), compensateResponses);
                 return;
             }
             try {
@@ -313,24 +353,39 @@ public class SagaOrchestrator {
                         stepPayload(execution, step, PHASE_COMPENSATE), step,
                         execution.getSagaId());
                 if (response.failed()) {
-                    appendLog(logs, step.seq(), PHASE_COMPENSATE, false,
-                            "http=" + response.statusCode());
-                    deadLetter(execution, plan, logs, failedSeq, failReason,
-                            "冲正被拒绝: step=" + step.name() + ", http=" + response.statusCode(),
-                            compensateResponses);
+                    String reason = "冲正被拒绝: step=" + step.name()
+                            + ", http=" + response.statusCode();
+                    appendLog(logs, step.seq(), PHASE_COMPENSATE,
+                            response.unknownResult() ? RESULT_UNKNOWN : RESULT_REJECTED,
+                            reason);
+                    if (response.unknownResult()) {
+                        markManual(execution, plan, logs, failedSeq, failReason,
+                                reason, compensateResponses);
+                    } else {
+                        deadLetter(execution, plan, logs, failedSeq, failReason,
+                                reason, compensateResponses);
+                    }
                     return;
                 }
-                appendLog(logs, step.seq(), PHASE_COMPENSATE, true, null);
+                appendLog(logs, step.seq(), PHASE_COMPENSATE, RESULT_SUCCESS, null);
                 Map<String, Object> snapshot = new LinkedHashMap<>();
                 snapshot.put("seq", step.seq());
                 snapshot.put("name", step.name());
                 snapshot.put("body", response.body());
                 compensateResponses.add(snapshot);
             } catch (StepInvocationException e) {
-                appendLog(logs, step.seq(), PHASE_COMPENSATE, false, e.getMessage());
-                deadLetter(execution, plan, logs, failedSeq, failReason,
-                        "冲正调用失败: step=" + step.name() + ", cause=" + e.getMessage(),
-                        compensateResponses);
+                boolean compensationUnknown = e.isUnknownResult();
+                appendLog(logs, step.seq(), PHASE_COMPENSATE,
+                        compensationUnknown ? RESULT_UNKNOWN : RESULT_REJECTED, e.getMessage());
+                String reason = "冲正调用" + (compensationUnknown ? "结果未知" : "失败")
+                        + ": step=" + step.name() + ", cause=" + e.getMessage();
+                if (compensationUnknown) {
+                    markManual(execution, plan, logs, failedSeq, failReason,
+                            reason, compensateResponses);
+                } else {
+                    deadLetter(execution, plan, logs, failedSeq, failReason,
+                            reason, compensateResponses);
+                }
                 return;
             }
         }
@@ -344,12 +399,29 @@ public class SagaOrchestrator {
         throw new SagaCompensatedException(execution.getSagaId(), failReason);
     }
 
-    /** 冲正失败 → DEAD 终态 + 死信落表 + ERROR 告警日志 */
+    /** 冲正明确失败 → DEAD 终态 + 死信落表 + ERROR 告警日志 */
     private void deadLetter(SagaExecution execution, TxPlan plan,
                             List<Map<String, Object>> logs, long failedSeq,
                             String failReason, String compensateError,
                             List<Map<String, Object>> compensateResponses) {
-        execution.setStatus(SagaStatus.DEAD);
+        terminalFailure(execution, logs, failedSeq, failReason, compensateError,
+                compensateResponses, SagaStatus.DEAD, PHASE_COMPENSATE);
+    }
+
+    /** 结果未知/预算耗尽 → MANUAL_REQUIRED + 死信，绝不显示“已回滚” */
+    private void markManual(SagaExecution execution, TxPlan plan,
+                            List<Map<String, Object>> logs, long failedSeq,
+                            String failReason, String reason,
+                            List<Map<String, Object>> compensateResponses) {
+        terminalFailure(execution, logs, failedSeq, failReason, reason,
+                compensateResponses, SagaStatus.MANUAL_REQUIRED, PHASE_COMPENSATE);
+    }
+
+    private void terminalFailure(SagaExecution execution, List<Map<String, Object>> logs,
+                                 long failedSeq, String failReason, String error,
+                                 List<Map<String, Object>> compensateResponses,
+                                 SagaStatus terminalStatus, String failPhase) {
+        execution.setStatus(terminalStatus);
         execution.setStepLogs(toJson(logs));
         execution.setUpdateTime(System.currentTimeMillis());
         sagaStore.update(execution);
@@ -362,8 +434,8 @@ public class SagaOrchestrator {
         letter.setFromStatus(execution.getFromStatus());
         letter.setToStatus(execution.getToStatus());
         letter.setFailedStepSeq(failedSeq);
-        letter.setFailPhase(PHASE_COMPENSATE);
-        letter.setErrorReason(truncate(compensateError + " | forward=" + failReason, 500));
+        letter.setFailPhase(failPhase);
+        letter.setErrorReason(truncate(error + " | forward=" + failReason, 500));
         letter.setCompensateResponses(toJson(compensateResponses));
         letter.setHandleStatus(0L);
         letter.setOperator(execution.getOperator());
@@ -371,11 +443,12 @@ public class SagaOrchestrator {
         sagaStore.saveDeadLetter(letter);
         increment(deadCounter);
         increment(deadLetterCounter);
-        // ERROR 告警位（监控按日志级别订阅，design/08 §3.3）
-        log.error("[saga][ALERT] 冲正失败转死信，需人工处置: sagaId={}, doc={}/{}, failedSeq={}, reason={}",
+        log.error("[saga][ALERT] {}，需人工处置: sagaId={}, doc={}/{}, failedSeq={}, reason={}",
+                terminalStatus == SagaStatus.MANUAL_REQUIRED
+                        ? "Saga 结果未知转人工" : "冲正失败转死信",
                 execution.getSagaId(), execution.getDocCode(), execution.getDocUuid(),
-                failedSeq, compensateError);
-        throw new SagaDeadException(execution.getSagaId(), compensateError);
+                failedSeq, error);
+        throw new SagaDeadException(execution.getSagaId(), error, terminalStatus);
     }
 
     /**
@@ -397,7 +470,8 @@ public class SagaOrchestrator {
         if (execution.getStatus() == SagaStatus.COMPLETED) {
             return SagaStatus.COMPLETED;
         }
-        if (execution.getStatus() != SagaStatus.ACTIONS_SUCCEEDED) {
+        if (execution.getStatus() != SagaStatus.ACTIONS_SUCCEEDED
+                && execution.getStatus() != SagaStatus.COMMIT_PENDING) {
             log.warn("[saga] 非待提交状态，忽略标记完成: sagaId={}, status={}",
                     sagaId, execution.getStatus());
             return execution.getStatus();
@@ -411,12 +485,52 @@ public class SagaOrchestrator {
     }
 
     /**
-     * 本地单据提交失败后的同步冲正（TX-03 收口）：外部步骤已全部成功，
-     * 但流转事务因版本/状态冲突或单据删除未能提交。逆序冲正所有已成功步骤，
-     * 使外部副作用与本地状态保持一致；冲正失败转死信。
+     * 标记进入本地提交阶段（ACTIONS_SUCCEEDED → COMMIT_PENDING）。
+     * 该中间态让恢复任务在“已准备提交但尚未落库”的崩溃窗口继续收口。
      *
      * @param sagaId Saga 实例 ID
-     * @return 冲正后的终态（COMPENSATED/DEAD）；记录缺失或非待提交状态时返回既有状态
+     * @return 更新后的状态；记录缺失返回 null
+     */
+    public SagaStatus markCommitPending(String sagaId) {
+        if (sagaId == null || sagaId.isBlank()) {
+            return null;
+        }
+        SagaExecution execution = sagaStore.find(sagaId).orElse(null);
+        if (execution == null) {
+            return null;
+        }
+        if (execution.getStatus() == SagaStatus.COMMIT_PENDING
+                || execution.getStatus() == SagaStatus.COMPLETED) {
+            return execution.getStatus();
+        }
+        if (execution.getStatus() != SagaStatus.ACTIONS_SUCCEEDED) {
+            return execution.getStatus();
+        }
+        execution.setStatus(SagaStatus.COMMIT_PENDING);
+        execution.setUpdateTime(System.currentTimeMillis());
+        sagaStore.update(execution);
+        return SagaStatus.COMMIT_PENDING;
+    }
+
+    /** 查询 Saga 当前状态（幂等预检查，记录缺失返回 null）。 */
+    public SagaStatus status(String sagaId) {
+        return sagaStore.status(sagaId);
+    }
+
+    /** Saga 在途锁租约上限（外部步骤 + 本地提交 + 余量）。 */
+    public long commitLeaseMs() {
+        return Math.max(properties.getForwardBudgetMs(), properties.getCompensationBudgetMs())
+                + properties.getLeaseMs();
+    }
+
+    /**
+     * 本地单据提交失败后的同步冲正（TX-03 收口）：外部步骤已全部成功，
+     * 但流转事务因版本/状态冲突或单据删除未能提交。逆序冲正所有已成功步骤，
+     * 使外部副作用与本地状态保持一致；冲正失败/未知转死信/人工。
+     *
+     * @param sagaId Saga 实例 ID
+     * @return 冲正后的终态（COMPENSATED/DEAD/MANUAL_REQUIRED）；
+     *         记录缺失或非待提交状态时返回既有状态
      */
     public SagaStatus compensateAfterCommitFailure(String sagaId) {
         if (sagaId == null || sagaId.isBlank()) {
@@ -427,10 +541,18 @@ public class SagaOrchestrator {
             log.warn("[saga] 提交失败冲正时执行记录缺失: sagaId={}", sagaId);
             return null;
         }
+        if (execution.getStatus() == SagaStatus.COMPENSATING) {
+            // 恢复任务正在补偿：不重复并发冲正
+            return SagaStatus.COMPENSATING;
+        }
         if (execution.getStatus() != SagaStatus.ACTIONS_SUCCEEDED
+                && execution.getStatus() != SagaStatus.COMMIT_PENDING
                 && execution.getStatus() != SagaStatus.COMPLETED) {
-            // 已完成冲正/死信，或仍在执行（由恢复任务接手），不重复冲正
             return execution.getStatus();
+        }
+        if (execution.getStatus() == SagaStatus.COMPLETED) {
+            // 已收口完成，不再冲正
+            return SagaStatus.COMPLETED;
         }
         TxPlan plan = parsePlan(execution.getTxPlanJson());
         if (plan == null || plan.steps().isEmpty()) {
@@ -442,11 +564,11 @@ public class SagaOrchestrator {
                 .mapToLong(TxPlan.TxStep::seq).max().orElse(0L) + 1;
         try {
             compensate(execution, plan, logs, failedSeq,
-                    "本地单据提交失败，执行外部步骤冲正", System.currentTimeMillis());
+                    "本地单据提交失败，执行外部步骤冲正", true, System.currentTimeMillis());
         } catch (SagaCompensatedException e) {
             return SagaStatus.COMPENSATED;
         } catch (SagaDeadException e) {
-            return SagaStatus.DEAD;
+            return e.getStatus();
         }
         return execution.getStatus();
     }
@@ -466,30 +588,57 @@ public class SagaOrchestrator {
         }
         List<Map<String, Object>> logs = parseLogs(execution.getStepLogs());
         long lastSuccess = 0L;
+        long lastUnknown = 0L;
         for (Map<String, Object> logEntry : logs) {
-            if (PHASE_ACTION.equals(logEntry.get("phase"))
-                    && Boolean.TRUE.equals(logEntry.get("result"))) {
-                long seq = asLong(logEntry.get("seq"));
-                if (seq > lastSuccess) {
-                    lastSuccess = seq;
-                }
+            if (!PHASE_ACTION.equals(logEntry.get("phase"))) {
+                continue;
+            }
+            long seq = asLong(logEntry.get("seq"));
+            if (Boolean.TRUE.equals(logEntry.get("result"))) {
+                lastSuccess = Math.max(lastSuccess, seq);
+            }
+            if (RESULT_UNKNOWN.equals(logEntry.get("status"))) {
+                lastUnknown = Math.max(lastUnknown, seq);
             }
         }
-        long startMs = execution.getCreateTime();
-        if (System.currentTimeMillis() - startMs > properties.getTotalBudgetMs()) {
-            log.warn("[saga-recovery] 预算已耗尽，转冲正: sagaId={}", execution.getSagaId());
-            long maxSeq = plan.steps().stream().mapToInt(TxPlan.TxStep::seq).max().orElse(0);
+        // 最近一步结果未知：可能已生效，不能重复执行；转补偿/人工
+        if (lastUnknown > lastSuccess) {
+            log.warn("[saga-recovery] 发现结果未知步骤，转补偿: sagaId={}, seq={}",
+                    execution.getSagaId(), lastUnknown);
             try {
-                compensate(execution, plan, logs, maxSeq + 1, "崩溃恢复：预算耗尽转冲正", startMs);
+                compensate(execution, plan, logs, lastUnknown,
+                        "崩溃恢复：步骤结果未知", true, System.currentTimeMillis());
             } catch (SagaCompensatedException | SagaDeadException expected) {
-                // 终态已在 compensate/deadLetter 内落库
+                // 终态已落库
             }
             return;
         }
-        log.info("[saga-recovery] 续推滞留 Saga: sagaId={}, resumeFromSeq={}",
-                execution.getSagaId(), lastSuccess + 1);
+        // 恢复使用新的尝试预算，不继承已耗尽的正向计时起点
+        long startMs = System.currentTimeMillis();
+        long budgetMs = properties.getRecoveryAttemptBudgetMs();
+        log.info("[saga-recovery] 续推滞留 Saga: sagaId={}, resumeFromSeq={}, budgetMs={}",
+                execution.getSagaId(), lastSuccess + 1, budgetMs);
         try {
-            runForward(execution, plan, logs, (int) (lastSuccess + 1), startMs);
+            runForward(execution, plan, logs, (int) (lastSuccess + 1), startMs, budgetMs);
+        } catch (SagaCompensatedException | SagaDeadException expected) {
+            // 终态已落库
+        }
+    }
+
+    /**
+     * 恢复滞留 COMPENSATING：从日志继续补偿已成功/未知步骤，使用独立补偿预算。
+     */
+    public void resumeCompensation(SagaExecution execution) {
+        TxPlan plan = parsePlan(execution.getTxPlanJson());
+        if (plan == null || plan.steps().isEmpty()) {
+            markDeadManual(execution, "补偿恢复时计划快照缺失");
+            return;
+        }
+        List<Map<String, Object>> logs = parseLogs(execution.getStepLogs());
+        long maxSeq = plan.steps().stream().mapToLong(TxPlan.TxStep::seq).max().orElse(0L) + 1;
+        try {
+            compensate(execution, plan, logs, maxSeq,
+                    "崩溃恢复：继续补偿", true, System.currentTimeMillis());
         } catch (SagaCompensatedException | SagaDeadException expected) {
             // 终态已落库
         }
@@ -578,9 +727,9 @@ public class SagaOrchestrator {
         throw new SagaDeadException(letter.getSagaId(), reason);
     }
 
-    /** 计划快照缺失时的兜底 DEAD 终态（恢复路径用） */
+    /** 计划快照缺失时的兜底 MANUAL_REQUIRED 终态（恢复路径用） */
     private void markDeadManual(SagaExecution execution, String reason) {
-        execution.setStatus(SagaStatus.DEAD);
+        execution.setStatus(SagaStatus.MANUAL_REQUIRED);
         execution.setUpdateTime(System.currentTimeMillis());
         sagaStore.update(execution);
         long now = System.currentTimeMillis();
@@ -599,7 +748,7 @@ public class SagaOrchestrator {
         sagaStore.saveDeadLetter(letter);
         increment(deadCounter);
         increment(deadLetterCounter);
-        log.error("[saga][ALERT] Saga 转死信（无法续推）: sagaId={}, reason={}",
+        log.error("[saga][ALERT] Saga 转人工（无法续推）: sagaId={}, reason={}",
                 execution.getSagaId(), reason);
     }
 
@@ -620,12 +769,19 @@ public class SagaOrchestrator {
         return toJson(payload);
     }
 
+    /** 兼容旧调用：boolean 结果映射为 SUCCESS/REJECTED。 */
     private void appendLog(List<Map<String, Object>> logs, long seq, String phase,
                            boolean success, String error) {
+        appendLog(logs, seq, phase, success ? RESULT_SUCCESS : RESULT_REJECTED, error);
+    }
+
+    private void appendLog(List<Map<String, Object>> logs, long seq, String phase,
+                           String status, String error) {
         Map<String, Object> entry = new LinkedHashMap<>();
         entry.put("seq", seq);
         entry.put("phase", phase);
-        entry.put("result", success);
+        entry.put("status", status);
+        entry.put("result", RESULT_SUCCESS.equals(status));
         entry.put("ts", System.currentTimeMillis());
         if (error != null) {
             entry.put("error", truncate(error, 300));
@@ -636,7 +792,18 @@ public class SagaOrchestrator {
     private boolean actionSucceeded(List<Map<String, Object>> logs, long seq) {
         for (Map<String, Object> entry : logs) {
             if (PHASE_ACTION.equals(entry.get("phase")) && asLong(entry.get("seq")) == seq
-                    && Boolean.TRUE.equals(entry.get("result"))) {
+                    && (Boolean.TRUE.equals(entry.get("result"))
+                    || RESULT_SUCCESS.equals(entry.get("status")))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean actionUnknown(List<Map<String, Object>> logs, long seq) {
+        for (Map<String, Object> entry : logs) {
+            if (PHASE_ACTION.equals(entry.get("phase")) && asLong(entry.get("seq")) == seq
+                    && RESULT_UNKNOWN.equals(entry.get("status"))) {
                 return true;
             }
         }

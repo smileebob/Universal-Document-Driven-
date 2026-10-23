@@ -20,10 +20,10 @@ import org.springframework.stereotype.Service;
 
 import com.example.common.exception.BizException;
 import com.example.common.exception.ErrorCode;
-import com.example.runtime.domain.model.AuditEntry;
 import com.example.runtime.domain.model.DocDataRecord;
 import com.example.runtime.domain.model.DocDefinition;
 import com.example.runtime.domain.model.DocDefinition.DocAttribute;
+import com.example.runtime.domain.model.DocOperationContext;
 import com.example.runtime.domain.model.FieldError;
 import com.example.runtime.domain.model.UniqueValues;
 import com.example.runtime.domain.port.DocConfigGateway;
@@ -31,10 +31,8 @@ import com.example.runtime.domain.port.DocDataStore;
 import com.example.runtime.domain.port.RefChecker;
 import com.example.runtime.domain.port.UniqueIndexStore;
 import com.example.runtime.domain.validation.DataValidationChain;
-import com.example.runtime.service.AuditService;
+import com.example.runtime.service.event.DocOperationProjector;
 import com.example.runtime.service.rule.DocRuleChecker;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
  * 单据数据 CRUD 服务（RD-05~08，design/09 §2.1 / prd/04 DC-05）。
@@ -53,25 +51,22 @@ public class DocDataService {
 
     private static final Logger log = LoggerFactory.getLogger(DocDataService.class);
 
-    /** 审计目标类型（prd/12 §1.9 口径） */
-    private static final String TARGET_TYPE_DOC = "doc";
-
     private final DocConfigGateway configGateway;
     private final DocDataStore docDataStore;
     private final DocRuleChecker ruleChecker;
-    private final AuditService auditService;
     private final UniqueIndexStore uniqueIndexStore;
     private final RefChecker refChecker;
+    private final DocOperationProjector projector;
 
     public DocDataService(DocConfigGateway configGateway, DocDataStore docDataStore,
-                          DocRuleChecker ruleChecker, AuditService auditService,
-                          UniqueIndexStore uniqueIndexStore, RefChecker refChecker) {
+                          DocRuleChecker ruleChecker, UniqueIndexStore uniqueIndexStore,
+                          RefChecker refChecker, DocOperationProjector projector) {
         this.configGateway = configGateway;
         this.docDataStore = docDataStore;
         this.ruleChecker = ruleChecker;
-        this.auditService = auditService;
         this.uniqueIndexStore = uniqueIndexStore;
         this.refChecker = refChecker;
+        this.projector = projector;
     }
 
     /** 已占位的唯一值（创建/换值失败回滚用） */
@@ -112,16 +107,20 @@ public class DocDataService {
                 operator, dept, now, now);
         // 唯一约束占位：规则通过后进入强一致写流程（DATA-01/02）
         List<ReservedUnique> reserved = reserveUnique(definition, attributes, uuid, null);
+        String operationId = UUID.randomUUID().toString();
+        DocOperationContext context = new DocOperationContext(operationId,
+                DocOperationContext.OP_CREATE, operator, MDC.get("traceId"), null,
+                "create", com.example.common.constants.DocMqConstants.EventTypes.DOC_CREATED,
+                0L, 0L, 0L, Map.of(), 1L, DocDefinition.INITIAL_STATUS,
+                attributes, record.getRelations(), false, now);
         try {
-            docDataStore.create(record, operator);
+            docDataStore.create(record, context);
         } catch (RuntimeException e) {
             releaseUnique(docCode, reserved, uuid);
             throw e;
         }
+        projector.projectNow(docCode, uuid, operationId);
 
-        auditService.recordAsync(new AuditEntry(UUID.randomUUID().toString(), "create",
-                TARGET_TYPE_DOC, docCode, uuid, operator, now, null,
-                docSnapshot(DocDefinition.INITIAL_STATUS, 1L, attributes), null, MDC.get("traceId")));
         log.info("[doc-data] 创建成功: {}/{}, operator={}", docCode, uuid, operator);
 
         Map<String, Object> result = new LinkedHashMap<>();
@@ -213,11 +212,17 @@ public class DocDataService {
         validateAttributes(definition, merged);
 
         List<ReservedUnique> reserved = reserveUnique(definition, merged, uuid, record.getAttributes());
+        long now = System.currentTimeMillis();
+        String operationId = UUID.randomUUID().toString();
+        DocOperationContext context = new DocOperationContext(operationId,
+                DocOperationContext.OP_UPDATE, operator, MDC.get("traceId"), null,
+                null, null, 0L, record.getVersion(), record.getCurrentStatus(),
+                record.getAttributes(), expectVersion + 1, record.getCurrentStatus(),
+                merged, buildDocRelations(definition, merged), false, now);
         boolean updated;
         try {
             updated = docDataStore.updateEditable(docCode, uuid, expectVersion,
-                    merged, buildDocRelations(definition, merged),
-                    System.currentTimeMillis());
+                    record.getCurrentStatus(), context);
         } catch (RuntimeException e) {
             releaseUnique(docCode, reserved, uuid);
             throw e;
@@ -228,11 +233,8 @@ public class DocDataService {
                     "单据已被并发修改，请刷新后重试");
         }
         releaseChangedUnique(definition, record.getAttributes(), merged, uuid);
+        projector.projectNow(docCode, uuid, operationId);
 
-        auditService.recordAsync(new AuditEntry(UUID.randomUUID().toString(), "update",
-                TARGET_TYPE_DOC, docCode, uuid, operator, System.currentTimeMillis(),
-                docSnapshot(record.getCurrentStatus(), record.getVersion(), record.getAttributes()),
-                docSnapshot(record.getCurrentStatus(), expectVersion + 1, merged), null, MDC.get("traceId")));
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("uuid", uuid);
         result.put("doc_code", docCode);
@@ -254,15 +256,19 @@ public class DocDataService {
         if (record.getCurrentStatus() != DocDefinition.INITIAL_STATUS) {
             throw new BizException(ErrorCode.ONLY_DRAFT_DELETE, "仅暂存状态的单据可删除");
         }
+        long now = System.currentTimeMillis();
+        String operationId = UUID.randomUUID().toString();
+        DocOperationContext context = new DocOperationContext(operationId,
+                DocOperationContext.OP_DELETE, operator, MDC.get("traceId"), null,
+                null, null, 0L, record.getVersion(), record.getCurrentStatus(),
+                record.getAttributes(), record.getVersion() + 1, record.getCurrentStatus(),
+                record.getAttributes(), record.getRelations(), true, now);
         boolean deleted = docDataStore.logicalDelete(docCode, uuid, record.getVersion(),
-                System.currentTimeMillis());
+                record.getCurrentStatus(), context);
         if (!deleted) {
             throw new BizException(ErrorCode.STATUS_CONFLICT, "删除条件冲突，请刷新后重试");
         }
-        auditService.recordAsync(new AuditEntry(UUID.randomUUID().toString(), "delete",
-                TARGET_TYPE_DOC, docCode, uuid, operator, System.currentTimeMillis(),
-                docSnapshot(record.getCurrentStatus(), record.getVersion(), record.getAttributes()),
-                null, null, MDC.get("traceId")));
+        projector.projectNow(docCode, uuid, operationId);
         return Map.of("uuid", uuid, "deleted", true);
     }
 
@@ -552,25 +558,6 @@ public class DocDataService {
         relation.put("uuid", String.valueOf(value));
         relation.put("attribute_code", attr.getCode());
         relations.add(relation);
-    }
-
-    // ==================== RD-12 审计快照 ====================
-
-    /** 审计快照序列化器（ObjectMapper 线程安全，静态共享） */
-    private static final ObjectMapper AUDIT_MAPPER = new ObjectMapper();
-
-    /** 审计快照 JSON（current_status/version/attributes，JSON Diff 可用，design/03 §2.10） */
-    private static String docSnapshot(long currentStatus, long version, Map<String, Object> attributes) {
-        Map<String, Object> snapshot = new LinkedHashMap<>();
-        snapshot.put("current_status", currentStatus);
-        snapshot.put("version", version);
-        snapshot.put("attributes", attributes == null ? Map.of() : attributes);
-        try {
-            return AUDIT_MAPPER.writeValueAsString(snapshot);
-        } catch (JsonProcessingException e) {
-            log.warn("[doc-data] 审计快照序列化失败，降级空快照", e);
-            return null;
-        }
     }
 
     /** 主行点查（不存在/已删 → 40401） */

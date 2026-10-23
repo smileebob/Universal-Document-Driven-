@@ -174,14 +174,15 @@ public class SchemaService {
                     Map.of("reasons", reasons));
         }
         Map<String, Object> before = snapshotOf(schema);
+
+        // 先完成在线索引候选/切流，失败则保持草稿态
+        indexRegistrar.registerRequired(schema.getAttributes());
+
         schema.setStatus(EntityStatus.PUBLISHED);
         schema.setPublishedAt(System.currentTimeMillis());
         schema.setUpdateTime(schema.getPublishedAt());
         schemaRepository.updateWithVersion(schema);
         schema.setVersion(schema.getVersion() + 1);
-
-        // 多元索引动态子字段注册（幂等，失败 WARN 不阻断）
-        indexRegistrar.registerQuietly(schema.getAttributes());
 
         // 发布失效链（≤5s）：DEL Redis → 广播
         invalidateCache(code);

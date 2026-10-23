@@ -770,6 +770,50 @@ public class InMemoryTablestore extends AbstractTablestoreTemplate {
         indexes.add(indexDefinition.getName());
     }
 
+    @Override
+    public com.example.common.infrastructure.tablestore.metadata.SearchIndexState describeSearchIndex(
+            String tableName, String indexName) {
+        boolean exists = hasSearchIndex(tableName, indexName);
+        return new com.example.common.infrastructure.tablestore.metadata.SearchIndexState(
+                indexName, exists, exists ? "RUNNING" : null,
+                exists ? "FULL" : null, exists ? System.currentTimeMillis() : null, null);
+    }
+
+    @Override
+    public boolean isSearchIndexCovered(String tableName, SearchIndexDef indexDefinition) {
+        return hasSearchIndex(tableName, indexDefinition.getName());
+    }
+
+    @Override
+    public void createSearchIndexIfAbsent(String tableName, SearchIndexDef indexDefinition) {
+        ensureSearchIndex(tableName, indexDefinition);
+    }
+
+    @Override
+    public void createBrotherSearchIndex(String tableName, String sourceIndex,
+                                         SearchIndexDef candidateDefinition) {
+        ensureSearchIndex(tableName, candidateDefinition);
+    }
+
+    @Override
+    public void switchSearchIndex(String tableName, String logicalIndex, String candidateIndex) {
+        List<String> indexes = searchIndexes.computeIfAbsent(tableName, key -> new ArrayList<>());
+        if (!indexes.contains(candidateIndex)) {
+            indexes.add(candidateIndex);
+        }
+        if (!indexes.contains(logicalIndex)) {
+            indexes.add(logicalIndex);
+        }
+    }
+
+    @Override
+    public void deleteSearchIndexIfExists(String tableName, String indexName) {
+        List<String> indexes = searchIndexes.get(tableName);
+        if (indexes != null) {
+            indexes.remove(indexName);
+        }
+    }
+
     /** 判断索引是否已登记（仿真启动建索引验证/测试辅助） */
     public boolean hasSearchIndex(String tableName, String indexName) {
         List<String> indexes = searchIndexes.get(tableName);
@@ -805,13 +849,13 @@ public class InMemoryTablestore extends AbstractTablestoreTemplate {
             default:
                 break;
         }
-        if (condition.hasColumnCondition()) {
+        for (RowCondition.ColumnCondition expected : condition.getColumnConditions()) {
             // 列缺失视为条件不满足（passIfMissing=false，version CAS 语义）
             TsColumnValue actual = existing == null ? null
-                    : existing.getColumn(condition.getExpectColumnName());
-            if (actual == null || !actual.equals(condition.getExpectColumnValue())) {
+                    : existing.getColumn(expected.columnName());
+            if (actual == null || !actual.equals(expected.value())) {
                 throw new TsConditionCheckException(
-                        "条件更新失败（列条件 " + condition.getExpectColumnName()
+                        "条件更新失败（列条件 " + expected.columnName()
                                 + " 不满足）: table=" + table);
             }
         }

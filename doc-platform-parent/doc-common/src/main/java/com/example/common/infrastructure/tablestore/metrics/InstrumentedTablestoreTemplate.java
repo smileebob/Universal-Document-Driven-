@@ -149,4 +149,36 @@ public class InstrumentedTablestoreTemplate implements TablestoreTemplate {
     public void reconcileSearchIndex(String tableName, SearchIndexDef indexDefinition) {
         delegate.reconcileSearchIndex(tableName, indexDefinition);
     }
+
+    @Override
+    public com.example.common.infrastructure.tablestore.metadata.SearchIndexState describeSearchIndex(
+            String tableName, String indexName) {
+        return delegate.describeSearchIndex(tableName, indexName);
+    }
+
+    @Override
+    public boolean isSearchIndexCovered(String tableName, SearchIndexDef indexDefinition) {
+        return delegate.isSearchIndexCovered(tableName, indexDefinition);
+    }
+
+    @Override
+    public void createSearchIndexIfAbsent(String tableName, SearchIndexDef indexDefinition) {
+        delegate.createSearchIndexIfAbsent(tableName, indexDefinition);
+    }
+
+    @Override
+    public void createBrotherSearchIndex(String tableName, String sourceIndex,
+                                         SearchIndexDef candidateDefinition) {
+        delegate.createBrotherSearchIndex(tableName, sourceIndex, candidateDefinition);
+    }
+
+    @Override
+    public void switchSearchIndex(String tableName, String logicalIndex, String candidateIndex) {
+        delegate.switchSearchIndex(tableName, logicalIndex, candidateIndex);
+    }
+
+    @Override
+    public void deleteSearchIndexIfExists(String tableName, String indexName) {
+        delegate.deleteSearchIndexIfExists(tableName, indexName);
+    }
 }

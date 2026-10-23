@@ -49,10 +49,12 @@ class TablestoreTemplateContractTest {
     @BeforeEach
     void setUp() {
         template = new InMemoryTablestore();
-        // 经 Bootstrap 加载 V1 定义并注册元数据（仿真侧仅注册，不建云表）
+        // 经 Bootstrap 加载 V1+V2 定义并注册元数据（仿真侧仅注册，不建云表）
         List<TableDefinition> definitions =
                 new TablestoreBootstrap(template).run();
-        assertThat(definitions).hasSize(16);
+        assertThat(definitions).hasSize(18);
+        assertThat(definitions).extracting(TableDefinition::getName)
+                .contains("event_delivery_cursor", "index_publish_task");
     }
 
     private TsPrimaryKey docPk(String uuid) {

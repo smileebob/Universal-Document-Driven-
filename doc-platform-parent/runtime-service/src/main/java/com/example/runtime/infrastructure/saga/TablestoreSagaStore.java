@@ -68,6 +68,9 @@ public class TablestoreSagaStore implements SagaStore {
         if (execution.getTraceId() != null) {
             columns.put("trace_id", TsColumnValue.of(execution.getTraceId()));
         }
+        columns.put("lease_owner", TsColumnValue.of(
+                execution.getLeaseOwner() == null ? "" : execution.getLeaseOwner()));
+        columns.put("lease_until", TsColumnValue.of(execution.getLeaseUntil()));
         columns.put("create_time", TsColumnValue.of(execution.getCreateTime()));
         columns.put("update_time", TsColumnValue.of(execution.getUpdateTime()));
         try {
@@ -95,6 +98,12 @@ public class TablestoreSagaStore implements SagaStore {
             updates.add(ColumnUpdate.put("step_logs", TsColumnValue.of(execution.getStepLogs())));
         }
         updates.add(ColumnUpdate.put("update_time", TsColumnValue.of(execution.getUpdateTime())));
+        if (execution.getLeaseOwner() != null) {
+            updates.add(ColumnUpdate.put("lease_owner",
+                    TsColumnValue.of(execution.getLeaseOwner())));
+            updates.add(ColumnUpdate.put("lease_until",
+                    TsColumnValue.of(execution.getLeaseUntil())));
+        }
         template.updateRow(TABLE_EXECUTION, sagaPk(execution.getSagaId()), updates);
     }
 
@@ -106,6 +115,68 @@ public class TablestoreSagaStore implements SagaStore {
     @Override
     public List<SagaExecution> scanActionsSucceeded(long updateTimeBefore) {
         return scanByStatus(SagaStatus.ACTIONS_SUCCEEDED, updateTimeBefore);
+    }
+
+    @Override
+    public List<SagaExecution> scanNonTerminal(long updateTimeBefore) {
+        List<SagaExecution> result = new ArrayList<>();
+        for (TsRow row : template.getRange(TABLE_EXECUTION)) {
+            SagaExecution execution = mapExecution(row);
+            SagaStatus status = execution.getStatus();
+            boolean recoverable = status == SagaStatus.EXECUTING
+                    || status == SagaStatus.ACTIONS_SUCCEEDED
+                    || status == SagaStatus.COMMIT_PENDING
+                    || status == SagaStatus.COMPENSATING;
+            if (recoverable && execution.getUpdateTime() <= updateTimeBefore) {
+                result.add(execution);
+            }
+        }
+        return result;
+    }
+
+    @Override
+    public boolean claim(SagaExecution execution, String owner, long leaseUntil,
+                         long expectedUpdateTime) {
+        try {
+            template.updateRow(TABLE_EXECUTION, sagaPk(execution.getSagaId()),
+                    List.of(
+                            ColumnUpdate.put("lease_owner", TsColumnValue.of(owner)),
+                            ColumnUpdate.put("lease_until", TsColumnValue.of(leaseUntil)),
+                            ColumnUpdate.put("update_time",
+                                    TsColumnValue.of(System.currentTimeMillis()))),
+                    RowCondition.expectExistAndAllEq(Map.of(
+                            "status", TsColumnValue.of(execution.getStatus().getCode()),
+                            "lease_owner", TsColumnValue.of(
+                                    execution.getLeaseOwner() == null
+                                            ? "" : execution.getLeaseOwner()),
+                            "update_time", TsColumnValue.of(expectedUpdateTime))));
+            execution.setLeaseOwner(owner);
+            execution.setLeaseUntil(leaseUntil);
+            return true;
+        } catch (TsConditionCheckException e) {
+            return false;
+        }
+    }
+
+    @Override
+    public SagaStatus status(String sagaId) {
+        return find(sagaId).map(SagaExecution::getStatus).orElse(null);
+    }
+
+    @Override
+    public boolean releaseLease(String sagaId, String owner, long updateTime) {
+        try {
+            template.updateRow(TABLE_EXECUTION, sagaPk(sagaId),
+                    List.of(
+                            ColumnUpdate.put("lease_owner", TsColumnValue.of("")),
+                            ColumnUpdate.put("lease_until", TsColumnValue.of(0L)),
+                            ColumnUpdate.put("update_time", TsColumnValue.of(updateTime))),
+                    RowCondition.expectExistAndColumnEq("lease_owner",
+                            TsColumnValue.of(owner)));
+            return true;
+        } catch (TsConditionCheckException e) {
+            return false;
+        }
     }
 
     /** 全表扫描 + 状态/更新时间过滤（V1 无索引，行数百级） */
@@ -206,6 +277,8 @@ public class TablestoreSagaStore implements SagaStore {
         execution.setTxPlanJson(row.getString("tx_plan"));
         execution.setOperator(row.getString("operator"));
         execution.setTraceId(row.getString("trace_id"));
+        execution.setLeaseOwner(row.getString("lease_owner"));
+        execution.setLeaseUntil(longOf(row, "lease_until"));
         execution.setCreateTime(longOf(row, "create_time"));
         execution.setUpdateTime(longOf(row, "update_time"));
         return execution;

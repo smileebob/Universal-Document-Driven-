@@ -12,6 +12,7 @@ import com.alicloud.openservices.tablestore.model.PrimaryKeyColumn;
 import com.alicloud.openservices.tablestore.model.PrimaryKeyValue;
 import com.alicloud.openservices.tablestore.model.Row;
 import com.alicloud.openservices.tablestore.model.RowExistenceExpectation;
+import com.alicloud.openservices.tablestore.model.condition.CompositeColumnValueCondition;
 import com.alicloud.openservices.tablestore.model.condition.SingleColumnValueCondition;
 import com.example.common.infrastructure.tablestore.model.RowCondition;
 import com.example.common.infrastructure.tablestore.model.TsColumnValue;
@@ -82,15 +83,22 @@ final class OtsTypes {
                 expectation = RowExistenceExpectation.IGNORE;
         }
         Condition sdkCondition = new Condition(expectation);
-        if (condition.hasColumnCondition()) {
-            SingleColumnValueCondition columnCondition = new SingleColumnValueCondition(
-                    condition.getExpectColumnName(),
-                    SingleColumnValueCondition.CompareOperator.EQUAL,
-                    toSdkColumnValue(condition.getExpectColumnValue()));
-            // 列缺失视为条件不满足（version CAS 语义）
-            columnCondition.setPassIfMissing(false);
-            columnCondition.setLatestVersionsOnly(true);
-            sdkCondition.setColumnCondition(columnCondition);
+        if (!condition.getColumnConditions().isEmpty()) {
+            CompositeColumnValueCondition composite = new CompositeColumnValueCondition(
+                    CompositeColumnValueCondition.LogicOperator.AND);
+            for (RowCondition.ColumnCondition expected : condition.getColumnConditions()) {
+                SingleColumnValueCondition columnCondition = new SingleColumnValueCondition(
+                        expected.columnName(),
+                        SingleColumnValueCondition.CompareOperator.EQUAL,
+                        toSdkColumnValue(expected.value()));
+                // 列缺失视为条件不满足（version CAS 语义）
+                columnCondition.setPassIfMissing(false);
+                columnCondition.setLatestVersionsOnly(true);
+                composite.addCondition(columnCondition);
+            }
+            sdkCondition.setColumnCondition(condition.getColumnConditions().size() == 1
+                    ? (SingleColumnValueCondition) composite.getSubConditions().get(0)
+                    : composite);
         }
         return sdkCondition;
     }

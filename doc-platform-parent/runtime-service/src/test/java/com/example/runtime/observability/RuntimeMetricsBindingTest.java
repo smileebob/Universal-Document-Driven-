@@ -79,6 +79,8 @@ class RuntimeMetricsBindingTest {
         columns.put("send_status", TsColumnValue.of(0L));
         columns.put("retry_count", TsColumnValue.of(0L));
         columns.put("next_retry_time", TsColumnValue.of(nextRetryTime));
+        columns.put("event_seq", TsColumnValue.of(1L));
+        columns.put("previous_event_seq", TsColumnValue.of(0L));
         columns.put("create_time", TsColumnValue.of(now));
         template.putRow("event_outbox", new TsRow(
                 TsPrimaryKey.builder()
@@ -102,8 +104,9 @@ class RuntimeMetricsBindingTest {
                 return "mock";
             }
         };
-        OutboxRelayService relay = new OutboxRelayService(store, publisher,
-                Runnable::run, new ObjectMapper());
+        OutboxRelayService relay = new OutboxRelayService(store,
+                new com.example.runtime.infrastructure.event.TablestoreDeliveryCursorStore(template),
+                publisher, Runnable::run, new ObjectMapper());
         MeterRegistry registry = new SimpleMeterRegistry();
         relay.bindMetrics(registry);
 
@@ -131,8 +134,9 @@ class RuntimeMetricsBindingTest {
                 return "mock";
             }
         };
-        OutboxRelayService relay = new OutboxRelayService(store, publisher,
-                Runnable::run, new ObjectMapper());
+        OutboxRelayService relay = new OutboxRelayService(store,
+                new com.example.runtime.infrastructure.event.TablestoreDeliveryCursorStore(template),
+                publisher, Runnable::run, new ObjectMapper());
         String partitionKey = PartitionKeys.dataKey("po", "uuid-m2");
         String eventId = insertPendingRow(partitionKey, System.currentTimeMillis());
 

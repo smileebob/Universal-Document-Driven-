@@ -1,5 +1,8 @@
 package com.example.common.infrastructure.tablestore.model;
 
+import java.util.List;
+import java.util.Map;
+
 /**
  * 行级条件（防腐层自有类型，隔离 SDK Condition/SingleColumnValueCondition）。
  *
@@ -8,7 +11,7 @@ package com.example.common.infrastructure.tablestore.model;
  *   <li>{@code IGNORE}：无条件写；</li>
  *   <li>{@code EXPECT_EXIST} / {@code EXPECT_NOT_EXIST}：行存在条件（唯一行 CAS 基础）；</li>
  *   <li>可选列等值条件（如 {@code version == 读取值}、{@code current_status == 期望旧状态}），
- *       乐观锁与防重复流转的统一入口。</li>
+ *       乐观锁与防重复流转的统一入口；多列条件按 AND 组合。</li>
  * </ul>
  */
 public final class RowCondition {
@@ -23,23 +26,23 @@ public final class RowCondition {
         EXPECT_NOT_EXIST
     }
 
-    private static final RowCondition IGNORE = new RowCondition(Expectation.IGNORE, null, null);
-    private static final RowCondition EXPECT_EXIST = new RowCondition(Expectation.EXPECT_EXIST, null, null);
+    private static final RowCondition IGNORE = new RowCondition(Expectation.IGNORE, List.of());
+    private static final RowCondition EXPECT_EXIST = new RowCondition(Expectation.EXPECT_EXIST, List.of());
     private static final RowCondition EXPECT_NOT_EXIST =
-            new RowCondition(Expectation.EXPECT_NOT_EXIST, null, null);
+            new RowCondition(Expectation.EXPECT_NOT_EXIST, List.of());
 
     private final Expectation expectation;
 
-    /** 列条件列名（null 表示无列条件） */
-    private final String expectColumnName;
+    /** 列等值条件（AND 组合；空表示无列条件） */
+    private final List<ColumnCondition> columnConditions;
 
-    /** 列条件期望值（等值比较） */
-    private final TsColumnValue expectColumnValue;
-
-    private RowCondition(Expectation expectation, String expectColumnName, TsColumnValue expectColumnValue) {
+    private RowCondition(Expectation expectation, List<ColumnCondition> columnConditions) {
         this.expectation = expectation;
-        this.expectColumnName = expectColumnName;
-        this.expectColumnValue = expectColumnValue;
+        this.columnConditions = columnConditions == null ? List.of() : List.copyOf(columnConditions);
+    }
+
+    /** 单列等值条件。 */
+    public record ColumnCondition(String columnName, TsColumnValue value) {
     }
 
     public static RowCondition ignore() {
@@ -62,7 +65,25 @@ public final class RowCondition {
      * @return 条件对象
      */
     public static RowCondition expectExistAndColumnEq(String columnName, TsColumnValue value) {
-        return new RowCondition(Expectation.EXPECT_EXIST, columnName, value);
+        return new RowCondition(Expectation.EXPECT_EXIST,
+                List.of(new ColumnCondition(columnName, value)));
+    }
+
+    /**
+     * 行存在 + 多列等值条件（AND）。用于日志投影认领、顺序游标等需要
+     * “状态 + 租约持有者”同时匹配的 CAS。
+     *
+     * @param conditions 列名 → 期望值（保持插入序）
+     * @return 条件对象
+     */
+    public static RowCondition expectExistAndAllEq(Map<String, TsColumnValue> conditions) {
+        if (conditions == null || conditions.isEmpty()) {
+            return EXPECT_EXIST;
+        }
+        List<ColumnCondition> list = conditions.entrySet().stream()
+                .map(entry -> new ColumnCondition(entry.getKey(), entry.getValue()))
+                .toList();
+        return new RowCondition(Expectation.EXPECT_EXIST, list);
     }
 
     public Expectation getExpectation() {
@@ -70,20 +91,27 @@ public final class RowCondition {
     }
 
     public boolean hasColumnCondition() {
-        return expectColumnName != null;
+        return !columnConditions.isEmpty();
     }
 
+    /** 列条件列表（AND；空表示无列条件）。 */
+    public List<ColumnCondition> getColumnConditions() {
+        return columnConditions;
+    }
+
+    /** 兼容单列调用方：首列条件名。 */
     public String getExpectColumnName() {
-        return expectColumnName;
+        return columnConditions.isEmpty() ? null : columnConditions.get(0).columnName();
     }
 
+    /** 兼容单列调用方：首列条件值。 */
     public TsColumnValue getExpectColumnValue() {
-        return expectColumnValue;
+        return columnConditions.isEmpty() ? null : columnConditions.get(0).value();
     }
 
     @Override
     public String toString() {
         return "RowCondition{" + expectation
-                + (expectColumnName == null ? "" : ", " + expectColumnName + "==" + expectColumnValue) + "}";
+                + (columnConditions.isEmpty() ? "" : ", " + columnConditions) + "}";
     }
 }

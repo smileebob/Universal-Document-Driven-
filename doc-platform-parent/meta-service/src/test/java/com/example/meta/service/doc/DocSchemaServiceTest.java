@@ -249,7 +249,7 @@ class DocSchemaServiceTest {
         assertThat(published.getVersion()).isEqualTo(1L);
         assertThat(published.getPublishedAt()).isNotNull();
         verify(docSchemaRepository).updateWithVersion(published);
-        verify(docDataIndexRegistrar).registerQuietly(published.getAttributes());
+        verify(docDataIndexRegistrar).registerRequired(published.getAttributes());
         verify(cacheService).invalidateShared(CacheKeyBuilder.docSchema("po"));
         ArgumentCaptor<SchemaInvalidationEvent> captor =
                 ArgumentCaptor.forClass(SchemaInvalidationEvent.class);

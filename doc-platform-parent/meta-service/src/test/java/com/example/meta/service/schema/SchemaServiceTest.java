@@ -202,7 +202,7 @@ class SchemaServiceTest {
         assertThat(published.getVersion()).isEqualTo(1L);
         assertThat(published.getPublishedAt()).isNotNull();
         verify(schemaRepository).updateWithVersion(published);
-        verify(indexRegistrar).registerQuietly(anyList());
+        verify(indexRegistrar).registerRequired(anyList());
         verify(cacheService).invalidateShared(CacheKeyBuilder.entitySchema("customer"));
         ArgumentCaptor<SchemaInvalidationEvent> captor =
                 ArgumentCaptor.forClass(SchemaInvalidationEvent.class);

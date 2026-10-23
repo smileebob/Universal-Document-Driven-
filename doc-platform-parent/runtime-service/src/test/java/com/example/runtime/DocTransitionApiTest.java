@@ -29,6 +29,7 @@ import com.example.runtime.controller.DocDataController;
 import com.example.runtime.controller.TransitionController;
 import com.example.runtime.domain.model.AuditEntry;
 import com.example.runtime.domain.model.DocDefinition;
+import com.example.runtime.domain.model.DocOperationContext;
 import com.example.runtime.domain.model.DocDefinition.DocAttribute;
 import com.example.runtime.domain.model.DocDefinition.DocStateDef;
 import com.example.runtime.domain.model.DocRuleBindings;
@@ -99,6 +100,7 @@ class DocTransitionApiTest {
     private MockMvc mockMvc;
     private FakeDocConfigGateway configGateway;
     private SagaOrchestrator sagaOrchestrator;
+    private com.example.runtime.service.event.DocOperationProjector projector;
     private com.example.runtime.infrastructure.tablestore.TablestoreEntityDataRepository entityRepository;
 
     @BeforeEach
@@ -142,15 +144,20 @@ class DocTransitionApiTest {
         }
 
         sagaOrchestrator = mock(SagaOrchestrator.class);
+        OutboxRelayService relayService = mock(OutboxRelayService.class);
+        projector = new com.example.runtime.service.event.DocOperationProjector(
+                new com.example.runtime.infrastructure.tablestore.TablestoreDocOperationLogStore(template),
+                new com.example.runtime.infrastructure.tablestore.TablestoreDocProjectionStore(template, mapper),
+                relayService);
         TransitionService transitionService = new TransitionService(
                 redissonClient, configGateway, docDataStore, ruleChecker, auditService,
-                sagaOrchestrator, mock(OutboxRelayService.class));
+                sagaOrchestrator, relayService, projector);
         entityRepository = new com.example.runtime.infrastructure.tablestore
                 .TablestoreEntityDataRepository(template, mapper);
         DocDataService docDataService = new DocDataService(
-                configGateway, docDataStore, ruleChecker, auditService,
+                configGateway, docDataStore, ruleChecker,
                 new com.example.runtime.infrastructure.tablestore.TablestoreUniqueIndexStore(template),
-                entityRepository);
+                entityRepository, projector);
         IdempotencyService idempotencyService =
                 new IdempotencyService(new TablestoreIdempotencyStore(template), mapper);
 
@@ -361,10 +368,11 @@ class DocTransitionApiTest {
     void staleDoubleWrite_casRejects() throws Exception {
         String uuid = createPo(100);
         // 正常流转一次：100 → 10（初始 version=1）
-        docDataStore.commitTransition(DOC, uuid, 1L, 100L, 10L, "alice", "submit", null);
+        commitAndProject(uuid, 1L, 100L, 10L, "alice", "op-transition-a");
         // 模拟锁失效后的迟到双写：仍以旧状态/旧版本发起 → 条件更新失败
         assertThatThrownBy(() -> docDataStore.commitTransition(
-                DOC, uuid, 1L, 100L, 10L, "bob", "submit", null))
+                DOC, uuid, 1L, 100L, 10L,
+                transitionContext(uuid, 1L, 100L, 10L, "bob", "op-transition-b")))
                 .isInstanceOf(TsConditionCheckException.class);
         // 无脏写：主行仍为 10/version=2，历史行无重复 seq
         mockMvc.perform(get("/api/v1/data/doc/{doc}/{uuid}", DOC, uuid))
@@ -389,7 +397,7 @@ class DocTransitionApiTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.version").value(2));
         // 提交后：修改 40008、删除 40009（属性修改后 version=2）
-        docDataStore.commitTransition(DOC, uuid, 2L, 100L, 10L, "alice", "submit", null);
+        commitAndProject(uuid, 2L, 100L, 10L, "alice", "op-transition-c");
         mockMvc.perform(put("/api/v1/data/doc/{doc}/{uuid}", DOC, uuid)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"attributes\": {\"amount\": 300}, \"version\": 3}"))
@@ -528,6 +536,22 @@ class DocTransitionApiTest {
     }
 
     // ==================== 装配工具 ====================
+
+    private DocOperationContext transitionContext(String uuid, long version, long from, long to,
+                                                  String operator, String operationId) {
+        return new DocOperationContext(operationId, DocOperationContext.OP_TRANSITION,
+                operator, null, null, "submit",
+                com.example.common.constants.DocMqConstants.EventTypes.DOC_STATUS_CHANGED,
+                0L, version, from, Map.of(), version + 1, to, Map.of(), List.of(),
+                false, System.currentTimeMillis());
+    }
+
+    private void commitAndProject(String uuid, long version, long from, long to,
+                                  String operator, String operationId) {
+        docDataStore.commitTransition(DOC, uuid, version, from, to,
+                transitionContext(uuid, version, from, to, operator, operationId));
+        projector.projectNow(DOC, uuid, operationId);
+    }
 
     /** 创建一张暂存态单据并返回 uuid */
     private String createPo(int amount) throws Exception {

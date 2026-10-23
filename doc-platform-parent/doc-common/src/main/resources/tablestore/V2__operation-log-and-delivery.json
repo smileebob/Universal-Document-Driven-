@@ -1,0 +1,75 @@
+{
+  "version": 2,
+  "description": "V2：不可变操作日志与按单据顺序投递。仅新增索引/表，不修改 V1 已发布定义。doc_data 日志行与业务主行同表同分区；event_outbox 增加 event_seq/previous_event_seq 列并由 event_outbox_seq_index 提供按单据顺序扫描；event_delivery_cursor 保存每单据 checkpoint/租约；index_publish_task 保存在线索引发布任务。",
+  "tables": [
+    {
+      "name": "doc_data",
+      "searchIndexOnly": true,
+      "searchIndexes": [
+        {
+          "name": "doc_data_operation_index",
+          "fields": [
+            { "name": "record_kind", "type": "LONG" },
+            { "name": "doc_code", "type": "KEYWORD" },
+            { "name": "doc_uuid", "type": "KEYWORD" },
+            { "name": "operation", "type": "KEYWORD" },
+            { "name": "operation_id", "type": "KEYWORD" },
+            { "name": "projection_status", "type": "LONG" },
+            { "name": "next_projection_time", "type": "LONG" },
+            { "name": "occurred_at", "type": "LONG" },
+            { "name": "event_seq", "type": "LONG" },
+            { "name": "saga_id", "type": "KEYWORD" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "event_outbox",
+      "searchIndexOnly": true,
+      "searchIndexes": [
+        {
+          "name": "event_outbox_seq_index",
+          "fields": [
+            { "name": "target_uuid", "type": "KEYWORD" },
+            { "name": "target_code", "type": "KEYWORD" },
+            { "name": "send_status", "type": "LONG" },
+            { "name": "event_seq", "type": "LONG" },
+            { "name": "previous_event_seq", "type": "LONG" },
+            { "name": "next_retry_time", "type": "LONG" },
+            { "name": "create_time", "type": "LONG" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "event_delivery_cursor",
+      "comment": "每单据事件投递 checkpoint/租约（EV-02，{doc_code}_{hash4(doc_uuid)} 与业务行同分区）",
+      "localTxn": true,
+      "partitionMode": "HASH",
+      "hashLength": 4,
+      "primaryKey": [
+        { "name": "partition_key", "type": "STRING" },
+        { "name": "doc_uuid", "type": "STRING" }
+      ]
+    },
+    {
+      "name": "index_publish_task",
+      "comment": "在线多元索引发布任务（INDEX-01：候选创建→同步→切换→保留回滚窗口）",
+      "partitionMode": "PLAIN",
+      "primaryKey": [
+        { "name": "task_id", "type": "STRING" }
+      ],
+      "searchIndexes": [
+        {
+          "name": "index_publish_task_index",
+          "fields": [
+            { "name": "status", "type": "KEYWORD" },
+            { "name": "table_name", "type": "KEYWORD" },
+            { "name": "logical_index", "type": "KEYWORD" },
+            { "name": "update_time", "type": "LONG" }
+          ]
+        }
+      ]
+    }
+  ]
+}

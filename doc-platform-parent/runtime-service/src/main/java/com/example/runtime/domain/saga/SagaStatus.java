@@ -15,6 +15,9 @@ public enum SagaStatus {
     /** 外部步骤全部成功，本地单据提交待收口（崩溃恢复据此决定提交或冲正） */
     ACTIONS_SUCCEEDED("ACTIONS_SUCCEEDED"),
 
+    /** 已准备提交本地事务（崩溃恢复与 ACTIONS_SUCCEEDED 同口径收口） */
+    COMMIT_PENDING("COMMIT_PENDING"),
+
     /** 外部步骤成功且本地单据已提交 */
     COMPLETED("COMPLETED"),
 
@@ -25,7 +28,10 @@ public enum SagaStatus {
     COMPENSATED("COMPENSATED"),
 
     /** 冲正失败转死信（ERROR 告警，人工处置） */
-    DEAD("DEAD");
+    DEAD("DEAD"),
+
+    /** 外部结果/补偿结果未知，无法安全自动收口（人工核对，不自动重试） */
+    MANUAL_REQUIRED("MANUAL_REQUIRED");
 
     private final String code;
 

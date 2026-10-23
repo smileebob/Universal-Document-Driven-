@@ -32,6 +32,7 @@ public class TablestoreEventOutboxStore implements EventOutboxStore {
 
     static final String TABLE = "event_outbox";
     static final String INDEX = "event_outbox_index";
+    static final String SEQ_INDEX = "event_outbox_seq_index";
 
     private final TablestoreTemplate template;
 
@@ -132,6 +133,18 @@ public class TablestoreEventOutboxStore implements EventOutboxStore {
     }
 
     @Override
+    public List<OutboxEvent> scanByDocAfterSeq(String docUuid, long lastSentSeq, int limit) {
+        QuerySpec spec = QuerySpec.builder()
+                .term("target_uuid", TsColumnValue.of(docUuid))
+                .range("event_seq", TsColumnValue.of(lastSentSeq), false, null, false)
+                .sortAsc("event_seq")
+                .limit(Math.min(Math.max(1, limit), QuerySpec.MAX_LIMIT))
+                .build();
+        SearchResult result = template.search(TABLE, SEQ_INDEX, spec);
+        return mapRows(result.getRows());
+    }
+
+    @Override
     public ScanPage scanSent(long before, int limit, String nextToken) {
         QuerySpec.Builder builder = QuerySpec.builder()
                 .term("send_status", TsColumnValue.of(1L))
@@ -166,6 +179,8 @@ public class TablestoreEventOutboxStore implements EventOutboxStore {
         event.setRetryCount(longOf(row, "retry_count"));
         event.setLastError(row.getString("last_error"));
         event.setNextRetryTime(longOf(row, "next_retry_time"));
+        event.setEventSeq(longOf(row, "event_seq"));
+        event.setPreviousEventSeq(longOf(row, "previous_event_seq"));
         event.setCreateTime(longOf(row, "create_time"));
         return event;
     }

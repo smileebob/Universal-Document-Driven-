@@ -113,6 +113,11 @@ public class QueryService {
     private record Page(boolean tokenMode, long offset, int limit, String token) {
     }
 
+    /** 查询投影不对外暴露的内部列（操作日志/在途锁/事件序号）。 */
+    private static final Set<String> INTERNAL_COLUMNS = Set.of(
+            "record_kind", "last_event_seq", "inflight_operation_id",
+            "inflight_saga_id", "inflight_lease_until");
+
     private final TablestoreTemplate template;
     private final ObjectMapper objectMapper;
 
@@ -932,6 +937,9 @@ public class QueryService {
         item.put("uuid", row.getPrimaryKey().get("uuid"));
         for (Map.Entry<String, TsColumnValue> entry : row.getColumns().entrySet()) {
             String name = entry.getKey();
+            if (INTERNAL_COLUMNS.contains(name)) {
+                continue;
+            }
             TsColumnValue column = entry.getValue();
             if ("attributes".equals(name) || "relations".equals(name)) {
                 item.put(name, parseJsonColumn(column));

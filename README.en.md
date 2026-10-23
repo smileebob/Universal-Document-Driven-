@@ -38,7 +38,7 @@ Business UI / external systems ──▶ doc-gateway ──▶ runtime-service (
 | Metadata-driven UI | Lists, forms, details, and state timeline | Specialized interaction pages still require custom code |
 | State machine | Transition configuration, legality checks, concurrency control, state history | Not a general BPM / multi-level approval engine |
 | Validation rules | SpEL expression and HTTP interface rules bound to states/actions | Rules validate only; they do not modify data |
-| Transactions & events | Ordered external steps, reverse compensation, Outbox events, dead-letter handling | Cross-table projections are eventually consistent; production must be exercised with real middleware |
+| Transactions & events | Same-table immutable operation log, ordered external steps, reverse compensation, per-document ordered delivery, dead-letter blocking | History/audit projections are eventually consistent; unknown Saga outcomes go manual |
 | Query & audit | Query DSL, pagination/filter/sort, operation audit and state history | Deep pagination is constrained by index semantics; retention policy is deployment-specific |
 | Authorization | Functional roles: platform admin / business admin / business user | No multi-tenancy, organizational isolation, or field-level permissions in this phase |
 
@@ -164,12 +164,15 @@ For development: `cd doc-platform-parent && ./deploy/app.sh stop doc-gateway` (d
 ## Known limitations and verification status
 
 - The rule engine validates only; there is no amount calculation, assignment, or field linkage. `unique` currently applies to document header fields only; uniqueness of detail sub-fields is not defined;
-- State history, events and audit are written as post-commit projections with retries, i.e. eventually consistent. **Extreme post-commit write failures rely on alerts and manual reconciliation**; high-reliability deployments must rehearse recovery/reconciliation before go-live;
-- Publishing a new searchable field triggers a search-index rebuild, during which list queries may be briefly unavailable. Production should use a renamed candidate index → switch → retire the old index; the code documents this path but does not automate it;
+- The business row and its immutable operation-log row commit in the same Tablestore local transaction. History, events, and audit are idempotently projected from that durable log and may lag briefly. After eight consecutive projection failures the log becomes manual, and the source log is retained; the system never fabricates a successful projection;
+- Publishing a new searchable field uses a `{index}_reindex` brother candidate → full sync → `switchIndexName` → keep the old index. The publish request fails while the candidate is not ready and leaves the definition in draft; the old index keeps serving. Old-index cleanup is disabled by default and requires an explicit rollback window; OTS retains only one brother rollback slot at a time;
 - Multidimensional indexes are built asynchronously: newly written rows may briefly be invisible to list filters, while detail reads by primary key are unaffected;
+- Events are delivered in per-document `event_seq` + checkpoint order. A failed event blocks later events until retry succeeds; exhausted retries block the document's sequence and raise an alert. A crash after send but before acknowledgement re-sends the same `event_id` (at-least-once), so consumers must be idempotent;
+- Outbox rows created before this upgrade have no `event_seq`; they must be drained or replayed through a migration window before strict ordering is enabled;
+- Existing deployments must run the V2 bootstrap first (new `event_delivery_cursor`, `index_publish_task`, and two incremental indexes); production must not rely on startup auto-create and should run it explicitly in the release pipeline;
 - Multi-tenancy, complex approval, print templates, and bulk Excel import/export are out of scope;
 - The [performance baseline](doc-platform-parent/docs/perf-report.md) comes from a local simulation environment and **does not represent production capacity**; re-test with real OTS/RocketMQ/Redis;
-- The current code changes pass the related backend unit/API tests; browser and real-cloud acceptance still need to be executed in the target environment.
+- This round was verified on a real OTS test instance for atomic operation logs, projection replay, ordered delivery, Saga crash recovery across two instances, and online index switchover. Browser E2E still needs to be run in the target environment.
 
 ## API and development documents
 

@@ -1,5 +1,6 @@
 package com.example.runtime.service.saga;
 
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -18,12 +19,14 @@ import org.junit.jupiter.api.Test;
 
 import com.example.common.infrastructure.tablestore.exception.TsConditionCheckException;
 import com.example.runtime.domain.model.DocDataRecord;
+import com.example.runtime.domain.model.DocOperationContext;
 import com.example.runtime.domain.port.DocDataStore;
 import com.example.runtime.domain.saga.SagaExecution;
 import com.example.runtime.domain.saga.SagaStatus;
 import com.example.runtime.domain.saga.SagaStore;
+import com.example.runtime.service.event.DocOperationProjector;
 
-/** Saga 崩溃恢复：ACTIONS_SUCCEEDED 的补提交/补收口/冲正分支（TX-03）。 */
+/** Saga 崩溃恢复：非终态认领 + 补提交/补收口/冲正分支。 */
 class SagaRecoveryTaskTest {
 
     private static final String DOC = "po";
@@ -33,6 +36,7 @@ class SagaRecoveryTaskTest {
     private SagaStore sagaStore;
     private SagaOrchestrator orchestrator;
     private DocDataStore docDataStore;
+    private DocOperationProjector projector;
     private SagaRecoveryTask task;
 
     @BeforeEach
@@ -40,10 +44,13 @@ class SagaRecoveryTaskTest {
         sagaStore = mock(SagaStore.class);
         orchestrator = mock(SagaOrchestrator.class);
         docDataStore = mock(DocDataStore.class);
+        projector = mock(DocOperationProjector.class);
         SagaProperties properties = new SagaProperties();
         properties.setRecoveryEnabled(true);
         properties.setStuckThresholdMs(0L);
-        task = new SagaRecoveryTask(sagaStore, orchestrator, properties, docDataStore);
+        task = new SagaRecoveryTask(sagaStore, orchestrator, properties, docDataStore, projector);
+        when(sagaStore.claim(any(SagaExecution.class), anyString(), anyLong(), anyLong()))
+                .thenReturn(true);
     }
 
     private SagaExecution execution(SagaStatus status) {
@@ -66,22 +73,23 @@ class SagaRecoveryTaskTest {
                 false, "alice", "dept", now, now);
     }
 
-    private void onlyActionsSucceeded(SagaExecution execution) {
-        when(sagaStore.scanStuckExecuting(anyLong())).thenReturn(List.of());
-        when(sagaStore.scanActionsSucceeded(anyLong())).thenReturn(List.of(execution));
+    private void only(SagaExecution execution) {
+        when(sagaStore.scanNonTerminal(anyLong())).thenReturn(List.of(execution));
+        when(sagaStore.find(SAGA)).thenReturn(Optional.of(execution));
     }
 
     @Test
     @DisplayName("单据仍为起始状态且版本一致 → 恢复补提交并标记 COMPLETED")
     void pendingCommit_commitsAndMarksCompleted() {
         SagaExecution execution = execution(SagaStatus.ACTIONS_SUCCEEDED);
-        onlyActionsSucceeded(execution);
+        only(execution);
         when(docDataStore.find(DOC, UUID)).thenReturn(Optional.of(doc(100L, 1L)));
 
         task.recover();
 
         verify(docDataStore).commitTransition(eq(DOC), eq(UUID), eq(1L), eq(100L), eq(10L),
-                eq("alice"), eq("saga-recovery"), eq(SAGA));
+                any(DocOperationContext.class));
+        verify(projector).projectNow(DOC, UUID, SAGA);
         verify(orchestrator).markCommitted(SAGA);
         verify(orchestrator, never()).compensateAfterCommitFailure(anyString());
     }
@@ -89,15 +97,15 @@ class SagaRecoveryTaskTest {
     @Test
     @DisplayName("单据已到目标状态 → 只补收口，不重复提交")
     void alreadyCommitted_marksOnly() {
-        SagaExecution execution = execution(SagaStatus.ACTIONS_SUCCEEDED);
-        onlyActionsSucceeded(execution);
+        SagaExecution execution = execution(SagaStatus.COMMIT_PENDING);
+        only(execution);
         when(docDataStore.find(DOC, UUID)).thenReturn(Optional.of(doc(10L, 2L)));
 
         task.recover();
 
         verify(orchestrator).markCommitted(SAGA);
         verify(docDataStore, never()).commitTransition(anyString(), anyString(), anyLong(),
-                anyLong(), anyLong(), anyString(), anyString(), anyString());
+                anyLong(), anyLong(), any(DocOperationContext.class));
         verify(orchestrator, never()).compensateAfterCommitFailure(anyString());
     }
 
@@ -105,7 +113,7 @@ class SagaRecoveryTaskTest {
     @DisplayName("单据版本/状态已变化 → 不提交，冲正外部步骤")
     void stateChanged_compensates() {
         SagaExecution execution = execution(SagaStatus.ACTIONS_SUCCEEDED);
-        onlyActionsSucceeded(execution);
+        only(execution);
         when(docDataStore.find(DOC, UUID)).thenReturn(Optional.of(doc(100L, 5L)));
         when(orchestrator.compensateAfterCommitFailure(SAGA)).thenReturn(SagaStatus.COMPENSATED);
 
@@ -114,18 +122,19 @@ class SagaRecoveryTaskTest {
         verify(orchestrator).compensateAfterCommitFailure(SAGA);
         verify(orchestrator, never()).markCommitted(SAGA);
         verify(docDataStore, never()).commitTransition(anyString(), anyString(), anyLong(),
-                anyLong(), anyLong(), anyString(), anyString(), anyString());
+                anyLong(), anyLong(), any(DocOperationContext.class));
+        verify(docDataStore).releaseOperation(eq(DOC), eq(UUID), eq(SAGA), anyLong());
     }
 
     @Test
     @DisplayName("提交竞争失败但另一方已提交 → 二次确认后只补收口，不冲正")
     void commitConflict_butCommittedByPeer_marksOnly() {
         SagaExecution execution = execution(SagaStatus.ACTIONS_SUCCEEDED);
-        onlyActionsSucceeded(execution);
+        only(execution);
         when(docDataStore.find(DOC, UUID)).thenReturn(
                 Optional.of(doc(100L, 1L)), Optional.of(doc(10L, 2L)));
         when(docDataStore.commitTransition(eq(DOC), eq(UUID), eq(1L), eq(100L), eq(10L),
-                eq("alice"), eq("saga-recovery"), eq(SAGA)))
+                any(DocOperationContext.class)))
                 .thenThrow(new TsConditionCheckException("version conflict"));
 
         task.recover();
@@ -139,16 +148,15 @@ class SagaRecoveryTaskTest {
     void executingResumed_actionsSucceededThenCommitted() {
         SagaExecution executing = execution(SagaStatus.EXECUTING);
         SagaExecution succeeded = execution(SagaStatus.ACTIONS_SUCCEEDED);
-        when(sagaStore.scanStuckExecuting(anyLong())).thenReturn(List.of(executing));
-        when(sagaStore.find(SAGA)).thenReturn(Optional.of(succeeded));
-        when(sagaStore.scanActionsSucceeded(anyLong())).thenReturn(List.of());
+        when(sagaStore.scanNonTerminal(anyLong())).thenReturn(List.of(executing));
+        when(sagaStore.find(SAGA)).thenReturn(Optional.of(executing), Optional.of(succeeded));
         when(docDataStore.find(DOC, UUID)).thenReturn(Optional.of(doc(100L, 1L)));
 
         task.recover();
 
         verify(orchestrator).resumeStuck(executing);
         verify(docDataStore).commitTransition(eq(DOC), eq(UUID), eq(1L), eq(100L), eq(10L),
-                eq("alice"), eq("saga-recovery"), eq(SAGA));
+                any(DocOperationContext.class));
         verify(orchestrator).markCommitted(SAGA);
     }
 }

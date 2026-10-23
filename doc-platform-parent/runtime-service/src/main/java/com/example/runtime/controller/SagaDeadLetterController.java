@@ -20,6 +20,7 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.common.exception.BizException;
 import com.example.common.exception.ErrorCode;
 import com.example.common.model.ApiResponse;
+import com.example.runtime.domain.port.DocDataStore;
 import com.example.runtime.domain.saga.SagaDeadLetter;
 import com.example.runtime.domain.saga.SagaExecution;
 import com.example.runtime.domain.saga.SagaStore;
@@ -40,10 +41,13 @@ public class SagaDeadLetterController {
 
     private final SagaStore sagaStore;
     private final SagaOrchestrator orchestrator;
+    private final DocDataStore docDataStore;
 
-    public SagaDeadLetterController(SagaStore sagaStore, SagaOrchestrator orchestrator) {
+    public SagaDeadLetterController(SagaStore sagaStore, SagaOrchestrator orchestrator,
+                                    DocDataStore docDataStore) {
         this.sagaStore = sagaStore;
         this.orchestrator = orchestrator;
+        this.docDataStore = docDataStore;
     }
 
     /**
@@ -97,6 +101,7 @@ public class SagaDeadLetterController {
             throw new BizException(ErrorCode.TX_FAILED, "死信重试仍失败: " + e.getMessage(),
                     Map.of("saga_id", sagaId));
         }
+        releaseInflight(letter);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("saga_id", sagaId);
         data.put("handle_status", 1L);
@@ -129,12 +134,13 @@ public class SagaDeadLetterController {
         letter.setHandleRemark(remark);
         sagaStore.saveDeadLetter(letter);
 
-        // 执行记录同步终态 DEAD（保持与死信一致，供运营视图）
+        // 执行记录保持人工终态（供运营视图）；人工确认后释放在途锁
         SagaExecution execution = sagaStore.find(sagaId).orElse(null);
         if (execution != null) {
             execution.setUpdateTime(System.currentTimeMillis());
             sagaStore.update(execution);
         }
+        releaseInflight(letter);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("saga_id", sagaId);
         data.put("handle_status", 2L);
@@ -145,6 +151,18 @@ public class SagaDeadLetterController {
     private SagaDeadLetter requireLetter(String sagaId) {
         return sagaStore.findDeadLetter(sagaId).orElseThrow(() ->
                 new BizException(ErrorCode.NOT_FOUND, "死信不存在: " + sagaId));
+    }
+
+    /** 人工处置/重试成功后释放单据在途锁。 */
+    private void releaseInflight(SagaDeadLetter letter) {
+        try {
+            docDataStore.releaseOperation(letter.getDocCode(), letter.getDocUuid(),
+                    letter.getSagaId(), System.currentTimeMillis());
+        } catch (RuntimeException e) {
+            // 锁可能已被收口/租约接管；保留日志由运维核对
+            org.slf4j.LoggerFactory.getLogger(SagaDeadLetterController.class)
+                    .warn("[saga] 释放在途锁失败: sagaId={}", letter.getSagaId(), e);
+        }
     }
 
     /** 死信行 → snake_case 视图 */

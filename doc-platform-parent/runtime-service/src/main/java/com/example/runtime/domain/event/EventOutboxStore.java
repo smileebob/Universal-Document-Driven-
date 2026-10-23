@@ -88,6 +88,17 @@ public interface EventOutboxStore {
      */
     ScanPage scanSent(long before, int limit, String nextToken);
 
+    /**
+     * 按单据读取 event_seq > lastSentSeq 的事件（升序，含已发送行）。
+     * 用于顺序投递时跳过已确认事件、识别最早未确认事件。
+     *
+     * @param docUuid    单据实例
+     * @param lastSentSeq 已确认的连续序号
+     * @param limit       页长
+     * @return 事件升序列表
+     */
+    List<OutboxEvent> scanByDocAfterSeq(String docUuid, long lastSentSeq, int limit);
+
     /** 扫描页（行 + 续翻游标） */
     record ScanPage(List<OutboxEvent> events, String nextToken) {
     }

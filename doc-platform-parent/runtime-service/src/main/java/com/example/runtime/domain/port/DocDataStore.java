@@ -5,104 +5,84 @@ import java.util.Map;
 import java.util.Optional;
 
 import com.example.runtime.domain.model.DocDataRecord;
+import com.example.runtime.domain.model.DocOperationContext;
 
 /**
- * 单据数据存储端口（doc_data / doc_data_history / event_outbox / audit_log
- * 同分区写入，design/03 §2.2 / §2.10 / §6.1 场景 3）。
+ * 单据数据存储端口（doc_data / doc_data_history / event_outbox / audit_log）。
  *
- * <p>实现位于 infrastructure 层（TablestoreDocDataStore）。OTS 局部事务为
- * 表级作用域（硬约束）：事务内仅原子提交 doc_data 主行，history/outbox/审计
- * 为事务提交后幂等补写（准最终一致，T1-T6 拆分见实现类注释）。</p>
+ * <p>真实性硬约束：OTS 局部事务为<b>表级</b>作用域。主行业务变更与同表同分区
+ * 的不可变操作日志行在同一局部事务内原子提交；history/outbox/audit 不再在
+ * 事务后 best-effort 补写，而由操作日志投影任务幂等重建（03 §4）。</p>
  */
 public interface DocDataStore {
 
-    /**
-     * 主键点查单据主行（强一致，TS-03）。
-     *
-     * @param docCode 单据编码
-     * @param uuid    单据实例唯一标识
-     * @return 主行（不存在/已逻辑删返回 empty）
-     */
+    /** 主键点查单据主行（强一致；不存在/已逻辑删返回 empty）。 */
     Optional<DocDataRecord> find(String docCode, String uuid);
 
     /**
-     * 创建单据（单表局部事务：主行 EXPECT_NOT_EXIST；创建历史行 seq=1
-     * 与 DOC_CREATED outbox 行在事务提交后幂等补写）。
+     * 创建单据：主行 + 操作日志行同事务原子提交（EXPECT_NOT_EXIST）。
      *
-     * @param record   主行数据（current_status=100 暂存）
-     * @param operator 操作人
+     * @param record  主行数据（current_status=100 暂存）
+     * @param context 冻结操作上下文（operationId/operator/trace/after 快照）
      */
-    default void create(DocDataRecord record, String operator) {
-        create(record, operator, null);
-    }
+    void create(DocDataRecord record, DocOperationContext context);
 
     /**
-     * 创建单据（traceId 重载：DOC_CREATED 事件信封写 traceparent）。
-     *
-     * @param record   主行数据
-     * @param operator 操作人
-     * @param traceId  链路追踪 ID（可空）
-     */
-    void create(DocDataRecord record, String operator, String traceId);
-
-    /**
-     * 可编辑态修改（version CAS：状态流转/删除同样递增 version，故版本条件同时覆盖
-     * 状态漂移与并发覆盖，TX-01）。
+     * 可编辑态修改：主行 version/status CAS 与日志行同一局部事务。
      *
      * @param docCode       单据编码
      * @param uuid          实例标识
-     * @param expectVersion 期望版本（乐观锁，落库条件比较）
-     * @param attributes    合并后属性
-     * @param relations     合并后 ref 关系
-     * @param updateTime    更新时间
-     * @return false=条件冲突（调用方映射 40901）
+     * @param expectVersion 期望版本
+     * @param expectStatus  期望当前状态
+     * @param context       合并后快照/操作人/operationId
+     * @return false=版本/状态条件冲突（调用方映射 40901）
      */
-    boolean updateEditable(String docCode, String uuid, long expectVersion,
-                           Map<String, Object> attributes, List<Map<String, Object>> relations,
-                           long updateTime);
+    boolean updateEditable(String docCode, String uuid, long expectVersion, long expectStatus,
+                           DocOperationContext context);
 
     /**
-     * 逻辑删（仅暂存态，deleted=1，version CAS）。
+     * 逻辑删：主行 version/status CAS 与日志行同一局部事务。
      *
-     * @return false=条件冲突（调用方映射 40901）
+     * @return false=条件冲突
      */
-    boolean logicalDelete(String docCode, String uuid, long expectVersion, long updateTime);
+    boolean logicalDelete(String docCode, String uuid, long expectVersion, long expectStatus,
+                          DocOperationContext context);
 
     /**
-     * 状态变更历史读取（doc_data_history 伴生表，分区级 GetRange，RD-08 只增不改）。
-     *
-     * @param docCode 单据编码
-     * @param uuid    实例标识
-     * @return snake_case 记录列表（seq 升序；单据无历史返回空列表）
+     * 状态变更历史读取（doc_data_history 伴生表，分区级 GetRange，seq 升序）。
      */
     List<Map<String, Object>> findHistory(String docCode, String uuid);
 
     /**
-     * 流转写入集（单表局部事务原子提交主行 CAS；历史行 / outbox /
-     * 同分区审计在事务提交后幂等补写，准最终一致）。
+     * 流转写入集：主行 CAS（expectedVersion + fromStatus）与日志行同一事务原子提交。
      *
-     * @param docCode         单据编码
-     * @param uuid            实例标识
-     * @param expectedVersion 规则/Saga 执行前读取的数据版本（快照版本，TX-02）
-     * @param fromStatus      期望当前状态（T3 CAS 条件列）
-     * @param toStatus        目标状态
-     * @param operator        操作人
-     * @param event           事件名（如 submit/audit）
-     * @param sagaId          Saga 实例 ID（无 Saga 时传 null；写事件 payload）
-     * @return 流转结果（新版本号/历史 seq/outbox event_id）
+     * @param context 冻结上下文（operation=transition、eventType、operator、sagaId、
+     *                before/after 快照、occurredAt）
      */
     TransitionOutcome commitTransition(String docCode, String uuid, long expectedVersion,
-                                       long fromStatus, long toStatus, String operator, String event,
-                                       String sagaId);
+                                       long fromStatus, long toStatus,
+                                       DocOperationContext context);
 
     /**
-     * 流转结果（响应体与幂等快照消费）。
+     * 在途操作锁：Saga 外部步骤执行前以版本 CAS 写入 operationId 所有权，
+     * 普通编辑/删除/其他流转在事务内识别并拒绝（03 §5.1）。
+     *
+     * @return 成功返回加锁后的新版本；条件冲突返回 0
+     */
+    long acquireOperation(String docCode, String uuid, long expectVersion, long expectStatus,
+                          String operationId, String sagaId, long leaseUntil);
+
+    /** 释放在途锁（仅 operationId 匹配时；版本递增使旧快照失效）。 */
+    boolean releaseOperation(String docCode, String uuid, String operationId, long updateTime);
+
+    /**
+     * 流转结果。
      *
      * @param version    流转后版本号
-     * @param historySeq 历史行 seq（评审项 1 整改后与 version 同值：CAS 保护、
-     *                   天然单调唯一，create 路径 version=1/seq=1 对齐）
-     * @param eventId    T5 outbox 事件 ID（阶段三：事务提交后即时首发入队）
+     * @param historySeq 历史行 seq（与 version 同值）
+     * @param eventId    稳定事件 ID（无事件为 null）
+     * @param eventSeq   同单据事件序号（无事件为 0）
      */
-    record TransitionOutcome(long version, long historySeq, String eventId) {
+    record TransitionOutcome(long version, long historySeq, String eventId, long eventSeq) {
     }
 }

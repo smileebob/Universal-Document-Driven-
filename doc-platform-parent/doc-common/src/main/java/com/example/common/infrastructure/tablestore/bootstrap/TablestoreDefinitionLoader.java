@@ -75,11 +75,15 @@ public final class TablestoreDefinitionLoader {
                 .thenComparing(Resource::getFilename,
                         Comparator.nullsLast(Comparator.naturalOrder())));
 
-        List<TableDefinition> definitions = new ArrayList<>();
+        Map<String, TableDefinition> byName = new java.util.LinkedHashMap<>();
         Map<String, String> tableSources = new HashMap<>();
         for (Resource resource : sorted) {
             DefinitionFile file = parse(resource);
             for (TableDefinition table : file.getTables()) {
+                if (table.isSearchIndexOnly()) {
+                    mergeSearchIndexes(byName, tableSources, table, resource.getFilename());
+                    continue;
+                }
                 // 评审修复 Minor-14：跨文件重名表 fail-fast（后版本不得重定义同名表）
                 String previous = tableSources.putIfAbsent(table.getName(), resource.getFilename());
                 if (previous != null) {
@@ -87,10 +91,35 @@ public final class TablestoreDefinitionLoader {
                             + table.getName() + "（" + previous + " 与 "
                             + resource.getFilename() + "）");
                 }
+                byName.put(table.getName(), table);
             }
-            definitions.addAll(file.getTables());
         }
-        return definitions;
+        return new ArrayList<>(byName.values());
+    }
+
+    /**
+     * 增量索引定义合并：V2+ 只声明 {@code searchIndexOnly=true} + searchIndexes，
+     * 合并到先前版本的同名基线表；不得借此重定义主键/分区/TTL。
+     */
+    private void mergeSearchIndexes(Map<String, TableDefinition> byName,
+                                    Map<String, String> tableSources,
+                                    TableDefinition indexOnly, String source) {
+        TableDefinition base = byName.get(indexOnly.getName());
+        if (base == null) {
+            throw new IllegalStateException("增量索引定义缺少基线表: " + indexOnly.getName()
+                    + "（" + source + "）");
+        }
+        for (var index : indexOnly.getSearchIndexes()) {
+            boolean duplicated = base.getSearchIndexes().stream()
+                    .anyMatch(existing -> existing.getName().equals(index.getName()));
+            if (duplicated) {
+                throw new IllegalStateException("增量索引定义与既有索引重名: "
+                        + indexOnly.getName() + "/" + index.getName()
+                        + "（" + tableSources.get(indexOnly.getName()) + " 与 "
+                        + source + "）");
+            }
+            base.getSearchIndexes().add(index);
+        }
     }
 
     /** 文件名 V 序号数值提取（无序号排最后） */

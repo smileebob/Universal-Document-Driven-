@@ -36,6 +36,12 @@ public class OutboxEvent {
     /** 下次可投递时间（CAS 抢占列） */
     private long nextRetryTime;
 
+    /** 同单据事件序号（projection 时分配；0=旧行/无序号） */
+    private long eventSeq;
+
+    /** 同单据前驱事件序号（首个事件为 0） */
+    private long previousEventSeq;
+
     /** 创建时间 */
     private long createTime;
 
@@ -117,6 +123,22 @@ public class OutboxEvent {
 
     public void setNextRetryTime(long nextRetryTime) {
         this.nextRetryTime = nextRetryTime;
+    }
+
+    public long getEventSeq() {
+        return eventSeq;
+    }
+
+    public void setEventSeq(long eventSeq) {
+        this.eventSeq = eventSeq;
+    }
+
+    public long getPreviousEventSeq() {
+        return previousEventSeq;
+    }
+
+    public void setPreviousEventSeq(long previousEventSeq) {
+        this.previousEventSeq = previousEventSeq;
     }
 
     public long getCreateTime() {

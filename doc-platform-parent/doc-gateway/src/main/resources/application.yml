@@ -61,11 +61,11 @@ spring:
             - id: meta-route
               uri: lb://meta-service
               predicates:
-                - Path=/api/v1/schema/**,/api/v1/rule/**,/api/v1/menu/**
+                - Path=/api/v1/schema/**,/api/v1/rule/**,/api/v1/menu/**,/api/v1/admin/index-tasks/**
             - id: runtime-route
               uri: lb://runtime-service
               predicates:
-                - Path=/api/v1/data/**,/api/v1/query/**,/api/v1/audit/**,/api/v1/saga/**,/api/v1/event/**
+                - Path=/api/v1/data/**,/api/v1/query/**,/api/v1/audit/**,/api/v1/saga/**,/api/v1/event/**,/api/v1/admin/reconcile/**,/api/v1/admin/doc-operations/**
   lifecycle:
     # 优雅停机等待时长，须小于部署脚本强杀超时（deploy/app.sh WAIT_TIMEOUT）
     timeout-per-shutdown-phase: 30s

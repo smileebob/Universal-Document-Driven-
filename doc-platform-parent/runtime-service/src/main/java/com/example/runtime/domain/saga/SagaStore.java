@@ -51,6 +51,45 @@ public interface SagaStore {
      */
     List<SagaExecution> scanActionsSucceeded(long updateTimeBefore);
 
+    /**
+     * 扫描全部可自动恢复的非终态记录（EXECUTING / ACTIONS_SUCCEEDED /
+     * COMMIT_PENDING / COMPENSATING）。
+     *
+     * @param updateTimeBefore update_time 上界（含）
+     * @return 非终态且滞留的记录
+     */
+    List<SagaExecution> scanNonTerminal(long updateTimeBefore);
+
+    /**
+     * 恢复租约认领：仅当 status/lease_owner 与读取值一致时写入租约。
+     * 多实例恢复任务据此串行推进同一 Saga。
+     *
+     * @param execution         读取到的执行记录
+     * @param owner             实例标识
+     * @param leaseUntil        租约到期时间
+     * @param expectedUpdateTime 读取到的 update_time（CAS 辅助）
+     * @return true=认领成功
+     */
+    boolean claim(SagaExecution execution, String owner, long leaseUntil, long expectedUpdateTime);
+
+    /**
+     * 当前状态查询（幂等预检查）。
+     *
+     * @param sagaId Saga 实例 ID
+     * @return 状态（记录缺失返回 null）
+     */
+    SagaStatus status(String sagaId);
+
+    /**
+     * 释放恢复租约（仅 lease_owner 匹配时；不覆盖业务状态）。
+     *
+     * @param sagaId    Saga 实例 ID
+     * @param owner     实例标识
+     * @param updateTime 本次释放时间
+     * @return true=释放成功
+     */
+    boolean releaseLease(String sagaId, String owner, long updateTime);
+
     /** 保存死信记录（整行覆盖写，同 saga 仅一条） */
     void saveDeadLetter(SagaDeadLetter deadLetter);
 

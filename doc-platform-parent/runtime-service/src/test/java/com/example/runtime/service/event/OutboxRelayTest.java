@@ -49,6 +49,7 @@ class OutboxRelayTest {
     private CapturingPublisher publisher;
     private OutboxRelayService relay;
     private String partitionKey;
+    private long nextSeq = 1L;
 
     @BeforeEach
     void setUp() {
@@ -57,14 +58,17 @@ class OutboxRelayTest {
         store = new TablestoreEventOutboxStore(template);
         publisher = new CapturingPublisher();
         // 同步执行器：测试内即时观察投递结果
-        relay = new OutboxRelayService(store, publisher, Runnable::run, new ObjectMapper());
+        relay = new OutboxRelayService(store,
+                new com.example.runtime.infrastructure.event.TablestoreDeliveryCursorStore(template),
+                publisher, Runnable::run, new ObjectMapper());
         partitionKey = PartitionKeys.dataKey(DOC, UUID);
     }
 
-    /** 直插一条 outbox 行（模拟流转事务写入侧） */
+    /** 直插一条 outbox 行（模拟投影写入侧，event_seq 单调递增） */
     private String insertPendingRow(long nextRetryTime, long retryCount) {
         String eventId = java.util.UUID.randomUUID().toString();
         long now = System.currentTimeMillis();
+        long seq = nextSeq++;
         Map<String, TsColumnValue> columns = new LinkedHashMap<>();
         columns.put("event_type", TsColumnValue.of(DocMqConstants.EventTypes.DOC_STATUS_CHANGED));
         columns.put("event_body", TsColumnValue.of("{\"event_id\":\"" + eventId
@@ -76,6 +80,8 @@ class OutboxRelayTest {
         columns.put("send_status", TsColumnValue.of(0L));
         columns.put("retry_count", TsColumnValue.of(retryCount));
         columns.put("next_retry_time", TsColumnValue.of(nextRetryTime));
+        columns.put("event_seq", TsColumnValue.of(seq));
+        columns.put("previous_event_seq", TsColumnValue.of(seq - 1));
         columns.put("create_time", TsColumnValue.of(now));
         template.putRow("event_outbox", new TsRow(
                 TsPrimaryKey.builder()
@@ -144,6 +150,65 @@ class OutboxRelayTest {
         assertThat(store.find(partitionKey, dueEventId).orElseThrow().getSendStatus()).isEqualTo(1L);
         assertThat(store.find(partitionKey, futureEventId).orElseThrow().getSendStatus()).isEqualTo(0L);
         assertThat(publisher.published).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("同单据顺序：首事件失败时后继不发送；恢复后按 1→2 投递")
+    void orderedDelivery_failureBlocksLaterEvents() {
+        publisher.succeed = false;
+        String first = insertPendingRow(System.currentTimeMillis(), 0L);
+        String second = insertPendingRow(System.currentTimeMillis(), 0L);
+
+        relay.scanAndDeliver();
+
+        assertThat(store.find(partitionKey, first).orElseThrow().getSendStatus()).isEqualTo(0L);
+        assertThat(store.find(partitionKey, first).orElseThrow().getRetryCount()).isEqualTo(1L);
+        assertThat(store.find(partitionKey, second).orElseThrow().getSendStatus()).isEqualTo(0L);
+        var cursor = new com.example.runtime.infrastructure.event
+                .TablestoreDeliveryCursorStore(template)
+                .find(partitionKey, UUID).orElseThrow();
+        assertThat(cursor.getLastSentSeq()).isZero();
+        assertThat(cursor.getBlockedEventSeq()).isZero();
+
+        // 复位首事件退避后重试，必须按 event_seq 顺序投递
+        template.updateRow("event_outbox",
+                TsPrimaryKey.builder().add("partition_key", partitionKey)
+                        .add("event_id", first).build(),
+                List.of(com.example.common.infrastructure.tablestore.model.ColumnUpdate.put(
+                                "next_retry_time", TsColumnValue.of(System.currentTimeMillis())),
+                        com.example.common.infrastructure.tablestore.model.ColumnUpdate.put(
+                                "retry_count", TsColumnValue.of(0L))));
+        publisher.succeed = true;
+        relay.scanAndDeliver();
+
+        assertThat(publisher.published).hasSize(2);
+        assertThat(publisher.published).extracting(message ->
+                        message.getUserProperties().get("event_seq"))
+                .containsExactly("1", "2");
+        assertThat(store.find(partitionKey, first).orElseThrow().getSendStatus()).isEqualTo(1L);
+        assertThat(store.find(partitionKey, second).orElseThrow().getSendStatus()).isEqualTo(1L);
+        var after = new com.example.runtime.infrastructure.event
+                .TablestoreDeliveryCursorStore(template)
+                .find(partitionKey, UUID).orElseThrow();
+        assertThat(after.getLastSentSeq()).isEqualTo(2L);
+    }
+
+    @Test
+    @DisplayName("退避耗尽阻断同单据序列：后继事件不越序，checkpoint 不推进")
+    void manualEvent_blocksLaterEvents() {
+        publisher.succeed = false;
+        String first = insertPendingRow(System.currentTimeMillis(), 7L);
+        String second = insertPendingRow(System.currentTimeMillis(), 0L);
+
+        relay.scanAndDeliver();
+
+        assertThat(store.find(partitionKey, first).orElseThrow().getSendStatus()).isEqualTo(2L);
+        assertThat(store.find(partitionKey, second).orElseThrow().getSendStatus()).isEqualTo(0L);
+        var cursor = new com.example.runtime.infrastructure.event
+                .TablestoreDeliveryCursorStore(template)
+                .find(partitionKey, UUID).orElseThrow();
+        assertThat(cursor.getBlockedEventSeq()).isEqualTo(1L);
+        assertThat(cursor.getLastSentSeq()).isZero();
     }
 
     @Test

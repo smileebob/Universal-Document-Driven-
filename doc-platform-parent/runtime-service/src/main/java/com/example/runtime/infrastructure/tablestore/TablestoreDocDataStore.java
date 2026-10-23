@@ -1,5 +1,8 @@
 package com.example.runtime.infrastructure.tablestore;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -9,7 +12,6 @@ import java.util.UUID;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.slf4j.MDC;
 import org.springframework.stereotype.Component;
 
 import com.example.common.constants.DocMqConstants;
@@ -21,43 +23,30 @@ import com.example.common.infrastructure.tablestore.model.TsColumnValue;
 import com.example.common.infrastructure.tablestore.model.TsPrimaryKey;
 import com.example.common.infrastructure.tablestore.model.TsRow;
 import com.example.common.infrastructure.tablestore.util.PartitionKeys;
+import com.example.runtime.domain.event.DocOperationLog;
 import com.example.runtime.domain.model.DocDataRecord;
+import com.example.runtime.domain.model.DocOperationContext;
 import com.example.runtime.domain.port.DocDataStore;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
- * 单据数据存储 Tablestore 实现（design/03 §2.2 / §2.10，design/05 §2.2 T1-T6）。
+ * 单据数据存储 Tablestore 实现。
  *
- * <p><b>OTS 局部事务表级作用域整改</b>：真实 OTS 局部事务是表级作用域（
- * StartLocalTransaction(anchorTable=doc_data) 返回的事务 ID 仅可用于 doc_data
- * 自身读写，跨表写报 OTSSessionNotExist），原「同分区键即可同事务」假设不成立。
- * 现改为：局部事务内只写 anchor 表 doc_data（主行 CAS）；history 流水 /
- * outbox 事件 / 流转审计均移至事务提交成功后以幂等写补写（确定性主键
- * putRow 覆盖），失败仅 WARN（[doc-data] 前缀）不阻断主流程：outbox 依赖
- * 5s 扫描兜底 + 八级退避，history/audit 为准最终一致（与平台
- * Outbox/Saga 补偿哲学一致）。Saga/规则/Redis 一律事务外（红线）。</p>
+ * <p><b>同一局部事务</b>：OTS 局部事务为表级作用域，但同表同分区可写多行。
+ * 主行业务变更与 {@code uuid=op:{docUuid}:{operationId}} 的不可变操作日志行
+ * 在同一事务提交；history/outbox/audit 由日志投影任务幂等重建（03 §4）。</p>
  *
- * <p>审计行以 hash4 变体分区键写入 audit_log（WriteGuard 场景 3 豁免，
- * design/03 §6.1）；unique_index 占位为事务外独立 EXPECT_NOT_EXIST 条件写，
- * 本就不在局部事务内，不受表级作用域约束影响。</p>
- *
- * <p>阶段三 T5 升级：outbox 行 event_type 采用 prd/12 §1.10 字典
- * （DOC_STATUS_CHANGED / DOC_CREATED），event_body 为 design/07 v1.1 信封
- * （event_id/event_type/schema_version/timestamp/payload/user_properties），
- * next_retry_time=创建时刻（中继即时可投）；event_id 提前预生成（确定性主键，
- * 补写幂等），经 TransitionOutcome 返回供事务提交后即时首发入队。</p>
+ * <p>日志行以 {@code record_kind=1} + {@code deleted=1} 隔离，现有业务检索
+ * 强制 deleted=0，不会把内部日志渲染成单据。</p>
  */
 @Component
 public class TablestoreDocDataStore implements DocDataStore {
 
     static final String TABLE_DOC_DATA = "doc_data";
-    static final String TABLE_DOC_HISTORY = "doc_data_history";
-    static final String TABLE_EVENT_OUTBOX = "event_outbox";
-    static final String TABLE_AUDIT_LOG = "audit_log";
 
-    /** 事件信封 schema 版本（design/07 v1.1） */
     private static final String ENVELOPE_SCHEMA_VERSION = "1.1";
+    private static final String EMPTY = "";
 
     private static final Logger log = LoggerFactory.getLogger(TablestoreDocDataStore.class);
 
@@ -74,6 +63,7 @@ public class TablestoreDocDataStore implements DocDataStore {
     @Override
     public Optional<DocDataRecord> find(String docCode, String uuid) {
         return template.getRow(TABLE_DOC_DATA, dataPk(docCode, uuid))
+                .filter(this::isBusinessRow)
                 .filter(row -> {
                     Long deleted = row.getLong("deleted");
                     return deleted == null || deleted == DocDataRecord.ACTIVE;
@@ -84,20 +74,17 @@ public class TablestoreDocDataStore implements DocDataStore {
     @Override
     public List<Map<String, Object>> findHistory(String docCode, String uuid) {
         String partitionKey = PartitionKeys.dataKey(docCode, uuid);
-        // 分区级 GetRange（非全表扫描）+ uuid 过滤（同分区可能共享 hash4）+ seq 升序
-        return template.getPartitionRange(TABLE_DOC_HISTORY, partitionKey).stream()
+        return template.getPartitionRange("doc_data_history", partitionKey).stream()
                 .filter(row -> uuid.equals(String.valueOf(row.getPrimaryKey().get("uuid"))))
                 .sorted(Comparator.comparingLong(TablestoreDocDataStore::seqOf))
                 .map(this::mapHistoryRow)
                 .toList();
     }
 
-    /** 历史行主键 seq 提取（缺失按 0 保守处理） */
     private static long seqOf(TsRow row) {
         return row.getPrimaryKey().get("seq") instanceof Number number ? number.longValue() : 0L;
     }
 
-    /** 历史行 → snake_case 视图（字段名与 doc_data_history 表定义对齐） */
     private Map<String, Object> mapHistoryRow(TsRow row) {
         Map<String, Object> view = new LinkedHashMap<>();
         view.put("seq", seqOf(row));
@@ -110,21 +97,33 @@ public class TablestoreDocDataStore implements DocDataStore {
         return view;
     }
 
-    // ==================== 创建（主行单表事务 + 提交后幂等补写 history/outbox） ====================
+    // ==================== 创建（主行 + 日志行同事务） ====================
 
     @Override
-    public void create(DocDataRecord record, String operator, String traceId) {
+    public void create(DocDataRecord record, DocOperationContext context) {
+        requireVersion(context, record.getVersion() - 1);
         String partitionKey = PartitionKeys.dataKey(record.getDocCode(), record.getUuid());
-        // OTS 硬约束：局部事务为表级作用域，事务内只写 anchor 表 doc_data 主行；
-        // history/outbox 为跨表写，移至提交后幂等补写（确定性主键，重试不重复）
+        long eventSeq = 0L;
+        String eventId = null;
+        if (context.hasEvent()) {
+            eventSeq = 1L;
+            eventId = eventId(context.operationId());
+        }
+        DocOperationLog logRow = buildLog(record.getDocCode(), record.getUuid(), partitionKey,
+                context, null, record.getCurrentStatus(), eventId, eventSeq, 0L);
+        long finalEventSeq = eventSeq;
+        String finalEventId = eventId;
         template.executeInLocalTransaction(TABLE_DOC_DATA, partitionKey, ops -> {
             Map<String, TsColumnValue> columns = new LinkedHashMap<>();
+            columns.put("record_kind", TsColumnValue.of(DocOperationLog.RECORD_KIND_DOC));
             columns.put("doc_code", TsColumnValue.of(record.getDocCode()));
             columns.put("current_status", TsColumnValue.of(record.getCurrentStatus()));
             columns.put("version", TsColumnValue.of(record.getVersion()));
             columns.put("attributes", TsColumnValue.of(toJson(record.getAttributes())));
             columns.put("relations", TsColumnValue.of(toJson(record.getRelations())));
             columns.put("deleted", TsColumnValue.of(DocDataRecord.ACTIVE));
+            columns.put("last_event_seq", TsColumnValue.of(finalEventSeq));
+            columns.put("inflight_operation_id", TsColumnValue.of(EMPTY));
             if (record.getCreator() != null) {
                 columns.put("creator", TsColumnValue.of(record.getCreator()));
             }
@@ -133,251 +132,432 @@ public class TablestoreDocDataStore implements DocDataStore {
             }
             columns.put("create_time", TsColumnValue.of(record.getCreateTime()));
             columns.put("update_time", TsColumnValue.of(record.getUpdateTime()));
-            // EXPECT_NOT_EXIST 幂等建行（uuid 服务端生成，撞键即 40901 语义）
-            ops.putRow(TABLE_DOC_DATA, new TsRow(dataPk(record.getDocCode(), record.getUuid()), columns),
+            ops.putRow(TABLE_DOC_DATA, new TsRow(
+                    dataPk(record.getDocCode(), record.getUuid()), columns),
                     RowCondition.expectNotExist());
+            ops.putRow(TABLE_DOC_DATA, toRow(logRow), RowCondition.expectNotExist());
             return null;
         });
-
-        // ---- 提交后幂等补写（best-effort，失败 WARN 不阻断主流程） ----
-        // 创建历史行 seq=1=version（RD-08：status_history 伴生，只增不改；确定性主键幂等，
-        // expectNotExist 拒绝静默覆盖）
-        putHistoryRowBestEffort(historyRow(partitionKey, record.getDocCode(),
-                record.getUuid(), record.getVersion(), null, record.getCurrentStatus(),
-                "create", operator, record.getUpdateTime(), record.getVersion()),
-                record.getDocCode() + "/" + record.getUuid() + " 创建历史行");
-
-        // DOC_CREATED outbox 行（EV-01：建单事件，prd/12 §1.10）；
-        // event_id 预生成 → 主键确定性 → putRow 覆盖幂等；失败时该事件无行可扫，
-        // 依赖 WARN 日志告警人工处置（与提交后补写失败的补偿口径一致）
-        long now = System.currentTimeMillis();
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("doc_uuid", record.getUuid());
-        payload.put("doc_code", record.getDocCode());
-        payload.put("doc_type", record.getDocCode());
-        payload.put("operator", operator == null ? "anonymous" : operator);
-        payload.put("version", record.getVersion());
-        payload.put("create_time", record.getCreateTime());
-        putRowBestEffort(TABLE_EVENT_OUTBOX,
-                outboxRow(partitionKey,
-                        DocMqConstants.EventTypes.DOC_CREATED, record.getDocCode(),
-                        record.getUuid(), payload, now, traceId),
-                record.getDocCode() + "/" + record.getUuid() + " DOC_CREATED outbox 行");
+        log.debug("[doc-log] 创建与操作日志已原子提交: {}/{}, operationId={}, eventId={}",
+                record.getDocCode(), record.getUuid(), context.operationId(), finalEventId);
     }
 
-    // ==================== 可编辑态修改 / 逻辑删 ====================
+    // ==================== 编辑 / 逻辑删（主行 + 日志行同事务） ====================
 
     @Override
     public boolean updateEditable(String docCode, String uuid, long expectVersion,
-                                  Map<String, Object> attributes, List<Map<String, Object>> relations,
-                                  long updateTime) {
-        // version CAS（TX-01）：服务层快照与落库版本必须一致；状态流转/逻辑删除同样
-        // 递增 version，因此该条件同时覆盖“状态已漂移”和“并发属性修改”。
-        List<ColumnUpdate> updates = List.of(
-                ColumnUpdate.put("attributes", TsColumnValue.of(toJson(attributes))),
-                ColumnUpdate.put("relations", TsColumnValue.of(toJson(relations))),
-                ColumnUpdate.put("update_time", TsColumnValue.of(updateTime)));
+                                  long expectStatus, DocOperationContext context) {
+        requireVersion(context, expectVersion);
+        String partitionKey = PartitionKeys.dataKey(docCode, uuid);
         try {
-            template.updateWithVersion(TABLE_DOC_DATA, dataPk(docCode, uuid), expectVersion, updates);
+            template.executeInLocalTransaction(TABLE_DOC_DATA, partitionKey, ops -> {
+                TsRow main = requireWritableMain(ops, docCode, uuid, expectVersion, expectStatus);
+                long previousSeq = longOf(main, "last_event_seq");
+                // 非事件操作不得占用 event_seq（event_seq 只描述事件顺序）
+                long eventSeq = context.hasEvent() ? previousSeq + 1 : 0L;
+                String eventId = context.hasEvent() ? eventId(context.operationId()) : null;
+                List<ColumnUpdate> updates = new java.util.ArrayList<>();
+                updates.add(ColumnUpdate.put("attributes",
+                        TsColumnValue.of(toJson(context.afterAttributes()))));
+                updates.add(ColumnUpdate.put("relations",
+                        TsColumnValue.of(toJson(context.afterRelations()))));
+                updates.add(ColumnUpdate.put("update_time",
+                        TsColumnValue.of(context.occurredAt())));
+                updates.add(ColumnUpdate.put("version",
+                        TsColumnValue.of(expectVersion + 1)));
+                if (context.hasEvent()) {
+                    updates.add(ColumnUpdate.put("last_event_seq",
+                            TsColumnValue.of(eventSeq)));
+                }
+                ops.updateRow(TABLE_DOC_DATA, dataPk(docCode, uuid), updates,
+                        versionStatusCondition(expectVersion, expectStatus));
+                DocOperationLog logRow = buildLog(docCode, uuid, partitionKey, context,
+                        expectStatus, expectStatus, eventId, eventSeq,
+                        context.hasEvent() ? previousSeq : 0L);
+                ops.putRow(TABLE_DOC_DATA, toRow(logRow), RowCondition.expectNotExist());
+                return null;
+            });
             return true;
-        } catch (TsConditionCheckException e) {
+        } catch (TsConditionCheckException | DocTransitionAbortException e) {
             return false;
         }
     }
 
     @Override
-    public boolean logicalDelete(String docCode, String uuid, long expectVersion, long updateTime) {
-        // updateWithVersion 自身写入 version+1，此处不得重复包含 version 列
-        List<ColumnUpdate> updates = List.of(
-                ColumnUpdate.put("deleted", TsColumnValue.of(DocDataRecord.DELETED)),
-                ColumnUpdate.put("update_time", TsColumnValue.of(updateTime)));
+    public boolean logicalDelete(String docCode, String uuid, long expectVersion,
+                                 long expectStatus, DocOperationContext context) {
+        requireVersion(context, expectVersion);
+        String partitionKey = PartitionKeys.dataKey(docCode, uuid);
         try {
-            template.updateWithVersion(TABLE_DOC_DATA, dataPk(docCode, uuid), expectVersion, updates);
+            template.executeInLocalTransaction(TABLE_DOC_DATA, partitionKey, ops -> {
+                requireWritableMain(ops, docCode, uuid, expectVersion, expectStatus);
+                List<ColumnUpdate> updates = List.of(
+                        ColumnUpdate.put("deleted", TsColumnValue.of(DocDataRecord.DELETED)),
+                        ColumnUpdate.put("update_time",
+                                TsColumnValue.of(context.occurredAt())),
+                        ColumnUpdate.put("version", TsColumnValue.of(expectVersion + 1)));
+                ops.updateRow(TABLE_DOC_DATA, dataPk(docCode, uuid), updates,
+                        versionStatusCondition(expectVersion, expectStatus));
+                DocOperationLog logRow = buildLog(docCode, uuid, partitionKey, context,
+                        expectStatus, expectStatus, null, 0L, 0L);
+                ops.putRow(TABLE_DOC_DATA, toRow(logRow), RowCondition.expectNotExist());
+                return null;
+            });
             return true;
-        } catch (TsConditionCheckException e) {
+        } catch (TsConditionCheckException | DocTransitionAbortException e) {
             return false;
         }
     }
 
-    // ==================== 流转收口（单表事务 T1/T3 + 提交后幂等补写 T4/T5/审计） ====================
+    // ==================== 流转收口 ====================
 
     @Override
     public TransitionOutcome commitTransition(String docCode, String uuid, long expectedVersion,
-                                              long fromStatus, long toStatus, String operator,
-                                              String event, String sagaId) {
+                                              long fromStatus, long toStatus,
+                                              DocOperationContext context) {
+        requireVersion(context, expectedVersion);
         String partitionKey = PartitionKeys.dataKey(docCode, uuid);
-        TsPrimaryKey mainPk = dataPk(docCode, uuid);
-        long now = System.currentTimeMillis();
-        // outbox event_id 预生成（确定性主键 → 补写幂等，随 TransitionOutcome 返回供提交后即时首发）
-        String eventId = UUID.randomUUID().toString();
-
-        // OTS 硬约束：局部事务仅允许写 anchorTable(doc_data) 自身；
-        // history/outbox/审计跨表写移至提交后幂等补写。
-        // seq 竞态整改（评审项 1）：原「事务外 GetRange 算 maxSeq+1」在锁失效
-        // 窗口下顺序流转交错会算出相同 seq，无条件 putRow 静默覆盖先写流水；
-        // 现 history seq 直接采用 CAS 保护、天然单调唯一的 newVersion（create 路径
-        // version=1/seq=1 天然对齐；正常单线流转下 seq 序列 1,2,3… 与旧 maxSeq+1 等价）。
-        long newVersion = template.executeInLocalTransaction(TABLE_DOC_DATA, partitionKey, ops -> {
-            // T1：事务内 GetRow 主行（锁内二次确认，防锁外快照漂移）
-            TsRow main = ops.getRow(TABLE_DOC_DATA, mainPk).orElseThrow(() ->
-                    new DocTransitionAbortException("单据不存在或已删除: " + uuid));
-            Long deleted = main.getLong("deleted");
-            if (deleted != null && deleted == DocDataRecord.DELETED) {
-                throw new DocTransitionAbortException("单据已删除: " + uuid);
+        return template.executeInLocalTransaction(TABLE_DOC_DATA, partitionKey, ops -> {
+            TsRow main = requireTransitionMain(ops, docCode, uuid, expectedVersion, fromStatus,
+                    context.operationId());
+            long previousSeq = longOf(main, "last_event_seq");
+            long eventSeq = context.hasEvent() ? previousSeq + 1 : previousSeq;
+            String eventId = context.hasEvent() ? eventId(context.operationId()) : null;
+            long newVersion = expectedVersion + 1;
+            List<ColumnUpdate> updates = new java.util.ArrayList<>();
+            updates.add(ColumnUpdate.put("current_status", TsColumnValue.of(toStatus)));
+            updates.add(ColumnUpdate.put("version", TsColumnValue.of(newVersion)));
+            updates.add(ColumnUpdate.put("update_time", TsColumnValue.of(context.occurredAt())));
+            updates.add(ColumnUpdate.put("inflight_operation_id", TsColumnValue.of(EMPTY)));
+            updates.add(ColumnUpdate.put("inflight_saga_id", TsColumnValue.of(EMPTY)));
+            updates.add(ColumnUpdate.put("inflight_lease_until", TsColumnValue.of(0L)));
+            if (context.hasEvent()) {
+                updates.add(ColumnUpdate.put("last_event_seq", TsColumnValue.of(eventSeq)));
             }
-            long snapshotStatus = main.getLong("current_status") == null
-                    ? -1L : main.getLong("current_status");
-            if (snapshotStatus != fromStatus) {
-                // 状态漂移（并发流转先行提交）→ 中断事务，外层映射 40901
-                throw new TsConditionCheckException("current_status 已变化: expect="
-                        + fromStatus + ", actual=" + snapshotStatus);
-            }
-            long snapshotVersion = main.getLong("version") == null
-                    ? 0L : main.getLong("version");
-            if (snapshotVersion != expectedVersion) {
-                // 快照版本漂移（规则/Saga 依据的旧数据被并发修改）→ 40901，TX-02
-                throw new TsConditionCheckException("version 已变化: expect="
-                        + expectedVersion + ", actual=" + snapshotVersion);
-            }
-
-            // T3：主行双列 CAS（current_status 条件列 + version 列 put 新值）
-            long versionAfter = snapshotVersion + 1;
-            List<ColumnUpdate> updates = List.of(
-                    ColumnUpdate.put("current_status", TsColumnValue.of(toStatus)),
-                    ColumnUpdate.put("version", TsColumnValue.of(versionAfter)),
-                    ColumnUpdate.put("update_time", TsColumnValue.of(now)));
-            ops.updateRow(TABLE_DOC_DATA, mainPk, updates,
-                    RowCondition.expectExistAndColumnEq("current_status",
-                            TsColumnValue.of(fromStatus)));
-
-            // T6：函数正常返回 → 模板提交事务（主行落库即用户可见结果可靠）
-            return versionAfter;
+            ops.updateRow(TABLE_DOC_DATA, dataPk(docCode, uuid), updates,
+                    versionStatusCondition(expectedVersion, fromStatus));
+            DocOperationLog logRow = buildLog(docCode, uuid, partitionKey, context,
+                    fromStatus, toStatus, eventId, eventSeq, previousSeq);
+            ops.putRow(TABLE_DOC_DATA, toRow(logRow), RowCondition.expectNotExist());
+            return new TransitionOutcome(newVersion, newVersion, eventId, eventSeq);
         });
+    }
 
-        // ---- 提交后幂等补写（best-effort，失败 WARN 不阻断，准最终一致） ----
-        // T4：历史行（只增不改；确定性主键 {partition_key,uuid,seq=newVersion}，
-        // expectNotExist 条件写：撞键宁可缺行走 WARN 告警，不可静默覆盖先写流水）
-        putHistoryRowBestEffort(historyRow(partitionKey, docCode, uuid, newVersion,
-                fromStatus, toStatus, event, operator, now, newVersion),
-                docCode + "/" + uuid + " 流转历史行 seq=" + newVersion);
+    // ==================== 在途操作锁 ====================
 
-        // T5：event_outbox 行（DOC_STATUS_CHANGED，design/07 v1.1 信封，阶段三 relay 消费）；
-        // 补写失败时该事件无行可扫，WARN 告警人工处置
+    @Override
+    public long acquireOperation(String docCode, String uuid, long expectVersion, long expectStatus,
+                                 String operationId, String sagaId, long leaseUntil) {
+        String partitionKey = PartitionKeys.dataKey(docCode, uuid);
+        try {
+            return template.executeInLocalTransaction(TABLE_DOC_DATA, partitionKey, ops -> {
+                TsRow main = ops.getRow(TABLE_DOC_DATA, dataPk(docCode, uuid))
+                        .orElseThrow(() -> new DocTransitionAbortException("单据不存在: " + uuid));
+                if (isDeleted(main)) {
+                    throw new DocTransitionAbortException("单据已删除: " + uuid);
+                }
+                if (longOf(main, "version") != expectVersion
+                        || longOf(main, "current_status") != expectStatus) {
+                    throw new TsConditionCheckException("版本或状态已变化");
+                }
+                String existing = main.getString("inflight_operation_id");
+                long existingLease = longOf(main, "inflight_lease_until");
+                if (existing != null && !existing.isBlank()
+                        && existingLease > System.currentTimeMillis()) {
+                    throw new TsConditionCheckException("存在未完成的在途操作: " + existing);
+                }
+                long newVersion = expectVersion + 1;
+                List<ColumnUpdate> updates = List.of(
+                        ColumnUpdate.put("version", TsColumnValue.of(newVersion)),
+                        ColumnUpdate.put("inflight_operation_id",
+                                TsColumnValue.of(operationId)),
+                        ColumnUpdate.put("inflight_saga_id",
+                                TsColumnValue.of(sagaId == null ? EMPTY : sagaId)),
+                        ColumnUpdate.put("inflight_lease_until", TsColumnValue.of(leaseUntil)),
+                        ColumnUpdate.put("update_time",
+                                TsColumnValue.of(System.currentTimeMillis())));
+                ops.updateRow(TABLE_DOC_DATA, dataPk(docCode, uuid), updates,
+                        versionStatusCondition(expectVersion, expectStatus));
+                return newVersion;
+            });
+        } catch (TsConditionCheckException | DocTransitionAbortException e) {
+            return 0L;
+        }
+    }
+
+    @Override
+    public boolean releaseOperation(String docCode, String uuid, String operationId,
+                                    long updateTime) {
+        String partitionKey = PartitionKeys.dataKey(docCode, uuid);
+        try {
+            template.executeInLocalTransaction(TABLE_DOC_DATA, partitionKey, ops -> {
+                TsRow main = ops.getRow(TABLE_DOC_DATA, dataPk(docCode, uuid)).orElse(null);
+                if (main == null || !operationId.equals(main.getString("inflight_operation_id"))) {
+                    throw new TsConditionCheckException("在途操作已释放或不属于本操作");
+                }
+                long version = longOf(main, "version");
+                ops.updateRow(TABLE_DOC_DATA, dataPk(docCode, uuid), List.of(
+                                ColumnUpdate.put("version", TsColumnValue.of(version + 1)),
+                                ColumnUpdate.put("inflight_operation_id", TsColumnValue.of(EMPTY)),
+                                ColumnUpdate.put("inflight_saga_id", TsColumnValue.of(EMPTY)),
+                                ColumnUpdate.put("inflight_lease_until", TsColumnValue.of(0L)),
+                                ColumnUpdate.put("update_time", TsColumnValue.of(updateTime))),
+                        RowCondition.expectExistAndAllEq(Map.of(
+                                "version", TsColumnValue.of(version),
+                                "inflight_operation_id", TsColumnValue.of(operationId))));
+                return null;
+            });
+            return true;
+        } catch (TsConditionCheckException | DocTransitionAbortException e) {
+            return false;
+        }
+    }
+
+    // ==================== 事务内校验 ====================
+
+    private TsRow requireWritableMain(com.example.common.infrastructure.tablestore.LocalTransactionOps ops,
+                                      String docCode, String uuid, long expectVersion,
+                                      long expectStatus) {
+        TsRow main = ops.getRow(TABLE_DOC_DATA, dataPk(docCode, uuid))
+                .orElseThrow(() -> new DocTransitionAbortException("单据不存在: " + uuid));
+        if (isDeleted(main)) {
+            throw new DocTransitionAbortException("单据已删除: " + uuid);
+        }
+        String inflight = main.getString("inflight_operation_id");
+        if (inflight != null && !inflight.isBlank()) {
+            throw new TsConditionCheckException("存在未完成的在途操作: " + inflight);
+        }
+        if (longOf(main, "version") != expectVersion
+                || longOf(main, "current_status") != expectStatus) {
+            throw new TsConditionCheckException("版本或状态已变化");
+        }
+        return main;
+    }
+
+    private TsRow requireTransitionMain(com.example.common.infrastructure.tablestore.LocalTransactionOps ops,
+                                        String docCode, String uuid, long expectedVersion,
+                                        long fromStatus, String operationId) {
+        TsRow main = ops.getRow(TABLE_DOC_DATA, dataPk(docCode, uuid))
+                .orElseThrow(() -> new DocTransitionAbortException("单据不存在: " + uuid));
+        if (isDeleted(main)) {
+            throw new DocTransitionAbortException("单据已删除: " + uuid);
+        }
+        String inflight = main.getString("inflight_operation_id");
+        if (inflight != null && !inflight.isBlank() && !inflight.equals(operationId)) {
+            throw new TsConditionCheckException("在途操作所有权不匹配: " + inflight);
+        }
+        if (longOf(main, "version") != expectedVersion
+                || longOf(main, "current_status") != fromStatus) {
+            throw new TsConditionCheckException("版本或状态已变化");
+        }
+        return main;
+    }
+
+    private static RowCondition versionStatusCondition(long version, long status) {
+        return RowCondition.expectExistAndAllEq(Map.of(
+                "version", TsColumnValue.of(version),
+                "current_status", TsColumnValue.of(status)));
+    }
+
+    private static boolean isDeleted(TsRow row) {
+        Long deleted = row.getLong("deleted");
+        return deleted != null && deleted == DocDataRecord.DELETED;
+    }
+
+    private static long longOf(TsRow row, String column) {
+        Long value = row.getLong(column);
+        return value == null ? 0L : value;
+    }
+
+    private boolean isBusinessRow(TsRow row) {
+        Long kind = row.getLong("record_kind");
+        return kind == null || kind == DocOperationLog.RECORD_KIND_DOC;
+    }
+
+    private static void requireVersion(DocOperationContext context, long expectVersion) {
+        if (context.afterVersion() != expectVersion + 1) {
+            throw new IllegalArgumentException("操作上下文 afterVersion 与期望版本不匹配: expect="
+                    + expectVersion + ", after=" + context.afterVersion());
+        }
+    }
+
+    // ==================== 操作日志构造 ====================
+
+    private DocOperationLog buildLog(String docCode, String uuid, String partitionKey,
+                                     DocOperationContext context, Long fromStatus, long toStatus,
+                                     String eventId, long eventSeq, long previousSeq) {
+        DocOperationLog logRow = new DocOperationLog();
+        logRow.setPartitionKey(partitionKey);
+        logRow.setLogUuid(logUuid(uuid, context.operationId()));
+        logRow.setOperationId(context.operationId());
+        logRow.setDocCode(docCode);
+        logRow.setDocUuid(uuid);
+        logRow.setOperation(context.operation());
+        logRow.setEvent(context.event());
+        logRow.setSchemaVersion(context.schemaVersion());
+        logRow.setRequestDigest(digest(context));
+        logRow.setExpectedVersion(context.beforeVersion());
+        logRow.setVersionAfter(context.afterVersion());
+        logRow.setFromStatus(fromStatus);
+        logRow.setToStatus(toStatus);
+        logRow.setEventId(eventId);
+        logRow.setEventType(context.eventType());
+        logRow.setEventSeq(eventSeq > 0 ? eventSeq : null);
+        logRow.setPreviousEventSeq(eventSeq > 0 ? previousSeq : null);
+        logRow.setSagaId(context.sagaId());
+        logRow.setOperator(context.operator());
+        logRow.setTraceId(context.traceId());
+        logRow.setOccurredAt(context.occurredAt());
+        logRow.setProjectionStatus(DocOperationLog.PROJECTION_PENDING);
+        logRow.setProjectionAttempts(0L);
+        logRow.setNextProjectionTime(context.occurredAt());
+        logRow.setProjectionLeaseOwner(EMPTY);
+        logRow.setProjectionLeaseUntil(0L);
+        logRow.setCreateTime(context.occurredAt());
+        if (context.changesStatus()) {
+            logRow.setHistoryJson(toJson(historySnapshot(fromStatus, toStatus, context)));
+        }
+        logRow.setAuditJson(toJson(auditSnapshot(context)));
+        if (context.hasEvent()) {
+            logRow.setEventJson(eventEnvelope(docCode, uuid, context, eventId,
+                    eventSeq, previousSeq));
+        }
+        return logRow;
+    }
+
+    private Map<String, Object> historySnapshot(Long fromStatus, long toStatus,
+                                                DocOperationContext context) {
+        Map<String, Object> history = new LinkedHashMap<>();
+        if (fromStatus != null) {
+            history.put("from_status", fromStatus);
+        }
+        history.put("to_status", toStatus);
+        history.put("operation", context.operation());
+        history.put("operator", context.operator());
+        history.put("operate_time", context.occurredAt());
+        history.put("version_after", context.afterVersion());
+        return history;
+    }
+
+    private Map<String, Object> auditSnapshot(DocOperationContext context) {
+        Map<String, Object> audit = new LinkedHashMap<>();
+        audit.put("before", DocOperationContext.OP_CREATE.equals(context.operation())
+                ? null : snapshot(context.beforeStatus(), context.beforeVersion(),
+                context.beforeAttributes(), false));
+        audit.put("after", context.deletedAfter() ? null
+                : snapshot(context.afterStatus(), context.afterVersion(),
+                context.afterAttributes(), false));
+        return audit;
+    }
+
+    private Map<String, Object> snapshot(long status, long version,
+                                         Map<String, Object> attributes, boolean deleted) {
+        Map<String, Object> snapshot = new LinkedHashMap<>();
+        snapshot.put("current_status", status);
+        snapshot.put("version", version);
+        snapshot.put("attributes", attributes == null ? Map.of() : attributes);
+        snapshot.put("deleted", deleted ? 1 : 0);
+        return snapshot;
+    }
+
+    private String eventEnvelope(String docCode, String docUuid, DocOperationContext context,
+                                 String eventId, long eventSeq, long previousSeq) {
         Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("doc_uuid", uuid);
+        payload.put("doc_uuid", docUuid);
         payload.put("doc_code", docCode);
         payload.put("doc_type", docCode);
-        payload.put("from_status", fromStatus);
-        payload.put("to_status", toStatus);
-        payload.put("operator", operator == null ? "" : operator);
-        payload.put("saga_id", sagaId == null ? "" : sagaId);
-        payload.put("version", newVersion);
-        payload.put("event", event == null ? "" : event);
-        putRowBestEffort(TABLE_EVENT_OUTBOX, new TsRow(
-                        outboxPk(partitionKey, eventId),
-                        outboxColumns(DocMqConstants.EventTypes.DOC_STATUS_CHANGED,
-                                docCode, uuid, payload, now, MDC.get("traceId"), eventId)),
-                docCode + "/" + uuid + " DOC_STATUS_CHANGED outbox 行 eventId=" + eventId);
-
-        // ⑧ 流转审计补写（audit_log hash4 变体分区键，WriteGuard 豁免）；
-        // log_id 随机不可重放，失败仅单次 WARN，不重试避免重复审计行
-        Map<String, TsColumnValue> audit = new LinkedHashMap<>();
-        audit.put("target_type", TsColumnValue.of("doc"));
-        audit.put("target_code", TsColumnValue.of(docCode));
-        audit.put("target_uuid", TsColumnValue.of(uuid));
-        audit.put("operator", TsColumnValue.of(operator == null ? "anonymous" : operator));
-        audit.put("operation", TsColumnValue.of("transition"));
-        // trace 闭环：流转审计落 trace_id 列（MDC 由网关/直连过滤器注入，design/11 §四）
-        String auditTraceId = MDC.get("traceId");
-        if (auditTraceId != null && !auditTraceId.isBlank()) {
-            audit.put("trace_id", TsColumnValue.of(auditTraceId));
+        payload.put("operator", context.operator() == null ? "anonymous" : context.operator());
+        payload.put("version", context.afterVersion());
+        payload.put("event_seq", eventSeq);
+        payload.put("previous_event_seq", previousSeq);
+        payload.put("operation_id", context.operationId());
+        payload.put("saga_id", context.sagaId() == null ? "" : context.sagaId());
+        payload.put("event", context.event() == null ? "" : context.event());
+        if (context.changesStatus()) {
+            payload.put("from_status", context.beforeStatus());
+            payload.put("to_status", context.afterStatus());
         }
-        // RD-12 before/after 快照列（对齐 audit_log_index，JSON Diff 可用，design/03 §2.10）
-        audit.put("before_value", TsColumnValue.of(toJson(Map.of("current_status", fromStatus))));
-        audit.put("after_value", TsColumnValue.of(toJson(Map.of(
-                "current_status", toStatus, "event", event == null ? "" : event))));
-        audit.put("operate_time", TsColumnValue.of(now));
-        putRowBestEffort(TABLE_AUDIT_LOG, new TsRow(
-                        TsPrimaryKey.builder()
-                                .add("partition_key", partitionKey)
-                                .add("log_id", UUID.randomUUID().toString())
-                                .build(), audit),
-                docCode + "/" + uuid + " 流转审计行");
-
-        return new TransitionOutcome(newVersion, newVersion, eventId);
-    }
-
-    /**
-     * 提交后幂等补写（best-effort）：确定性主键 putRow 覆盖，失败仅 WARN
-     * 不阻断主流程（主数据已在单表事务内可靠落库；history/audit 为准最终
-     * 一致，outbox 依赖 5s 扫描兜底 + 八级退避）。
-     */
-    private void putRowBestEffort(String table, TsRow row, String describe) {
-        try {
-            template.putRow(table, row);
-        } catch (RuntimeException e) {
-            log.warn("[doc-data] 提交后补写失败（不阻断主流程，依赖既有补偿机制）: table={}, {}",
-                    table, describe, e);
-        }
-    }
-
-    /**
-     * 历史行补写（seq 竞态整改）：EXPECT_NOT_EXIST 条件写，撞键宁可缺行走
-     * WARN 告警，不可静默覆盖先写流水（history 只增不改，缺行可由告警人工补录）。
-     */
-    private void putHistoryRowBestEffort(TsRow row, String describe) {
-        try {
-            template.putRow(TABLE_DOC_HISTORY, row, RowCondition.expectNotExist());
-        } catch (TsConditionCheckException e) {
-            log.warn("[doc-data] 历史行已存在，跳过补写（seq 冲突拒绝覆盖，需人工核对）: {}",
-                    describe);
-        } catch (RuntimeException e) {
-            log.warn("[doc-data] 提交后补写失败（不阻断主流程，依赖既有补偿机制）: table={}, {}",
-                    TABLE_DOC_HISTORY, describe, e);
-        }
-    }
-
-    // ==================== outbox 行构造（design/07 v1.1 信封） ====================
-
-    /** outbox 行（独立事件 ID 生成，建单路径用） */
-    private TsRow outboxRow(String partitionKey, String eventType, String docCode,
-                            String uuid, Map<String, Object> payload, long now, String traceId) {
-        String eventId = UUID.randomUUID().toString();
-        return new TsRow(outboxPk(partitionKey, eventId),
-                outboxColumns(eventType, docCode, uuid, payload, now, traceId, eventId));
-    }
-
-    /**
-     * outbox 列集：event_type/event_body(v1.1 信封)/target_code/target_uuid/
-     * send_status=0/retry_count=0/next_retry_time=now/create_time。
-     */
-    private Map<String, TsColumnValue> outboxColumns(String eventType, String docCode,
-                                                     String uuid, Map<String, Object> payload,
-                                                     long now, String traceId, String eventId) {
         Map<String, Object> envelope = new LinkedHashMap<>();
         envelope.put("event_id", eventId);
-        envelope.put("event_type", eventType);
+        envelope.put("event_type", context.eventType());
         envelope.put("schema_version", ENVELOPE_SCHEMA_VERSION);
-        envelope.put("timestamp", now);
+        envelope.put("timestamp", context.occurredAt());
         envelope.put("payload", payload);
-        if (traceId != null && !traceId.isBlank()) {
-            envelope.put("user_properties", Map.of("traceparent", traceId));
+        if (context.traceId() != null && !context.traceId().isBlank()) {
+            envelope.put("user_properties", Map.of("traceparent", context.traceId()));
         }
-        Map<String, TsColumnValue> columns = new LinkedHashMap<>();
-        columns.put("event_type", TsColumnValue.of(eventType));
-        columns.put("event_body", TsColumnValue.of(toJson(envelope)));
-        columns.put("target_code", TsColumnValue.of(docCode));
-        columns.put("target_uuid", TsColumnValue.of(uuid));
-        columns.put("send_status", TsColumnValue.of(0L));
-        columns.put("retry_count", TsColumnValue.of(0L));
-        columns.put("next_retry_time", TsColumnValue.of(now));
-        columns.put("create_time", TsColumnValue.of(now));
-        return columns;
+        return toJson(envelope);
     }
 
     // ==================== 行构造与映射 ====================
 
-    /** 主键构造：partition_key + uuid */
+    private TsRow toRow(DocOperationLog logRow) {
+        Map<String, TsColumnValue> columns = new LinkedHashMap<>();
+        columns.put("record_kind", TsColumnValue.of(DocOperationLog.RECORD_KIND_OPERATION));
+        columns.put("doc_code", TsColumnValue.of(logRow.getDocCode()));
+        columns.put("doc_uuid", TsColumnValue.of(logRow.getDocUuid()));
+        columns.put("current_status", TsColumnValue.of(logRow.getToStatus() == null
+                ? 0L : logRow.getToStatus()));
+        columns.put("deleted", TsColumnValue.of(DocDataRecord.DELETED));
+        columns.put("operation_id", TsColumnValue.of(logRow.getOperationId()));
+        columns.put("operation", TsColumnValue.of(logRow.getOperation()));
+        if (logRow.getEvent() != null && !logRow.getEvent().isBlank()) {
+            columns.put("event", TsColumnValue.of(logRow.getEvent()));
+        }
+        columns.put("schema_version", TsColumnValue.of(logRow.getSchemaVersion()));
+        columns.put("request_digest", TsColumnValue.of(
+                logRow.getRequestDigest() == null ? "" : logRow.getRequestDigest()));
+        columns.put("expected_version", TsColumnValue.of(logRow.getExpectedVersion()));
+        columns.put("version_after", TsColumnValue.of(logRow.getVersionAfter()));
+        if (logRow.getFromStatus() != null) {
+            columns.put("from_status", TsColumnValue.of(logRow.getFromStatus()));
+        }
+        if (logRow.getToStatus() != null) {
+            columns.put("to_status", TsColumnValue.of(logRow.getToStatus()));
+        }
+        if (logRow.getEventId() != null) {
+            columns.put("event_id", TsColumnValue.of(logRow.getEventId()));
+        }
+        if (logRow.getEventType() != null) {
+            columns.put("event_type", TsColumnValue.of(logRow.getEventType()));
+        }
+        if (logRow.getEventSeq() != null) {
+            columns.put("event_seq", TsColumnValue.of(logRow.getEventSeq()));
+        }
+        if (logRow.getPreviousEventSeq() != null) {
+            columns.put("previous_event_seq", TsColumnValue.of(logRow.getPreviousEventSeq()));
+        }
+        if (logRow.getHistoryJson() != null) {
+            columns.put("history_json", TsColumnValue.of(logRow.getHistoryJson()));
+        }
+        if (logRow.getAuditJson() != null) {
+            columns.put("audit_json", TsColumnValue.of(logRow.getAuditJson()));
+        }
+        if (logRow.getEventJson() != null) {
+            columns.put("event_json", TsColumnValue.of(logRow.getEventJson()));
+        }
+        if (logRow.getSagaId() != null) {
+            columns.put("saga_id", TsColumnValue.of(logRow.getSagaId()));
+        }
+        columns.put("operator", TsColumnValue.of(
+                logRow.getOperator() == null ? "anonymous" : logRow.getOperator()));
+        if (logRow.getTraceId() != null) {
+            columns.put("trace_id", TsColumnValue.of(logRow.getTraceId()));
+        }
+        columns.put("occurred_at", TsColumnValue.of(logRow.getOccurredAt()));
+        columns.put("projection_status", TsColumnValue.of(logRow.getProjectionStatus()));
+        columns.put("projection_attempts", TsColumnValue.of(logRow.getProjectionAttempts()));
+        columns.put("next_projection_time", TsColumnValue.of(logRow.getNextProjectionTime()));
+        columns.put("projection_lease_owner", TsColumnValue.of(
+                logRow.getProjectionLeaseOwner() == null ? EMPTY : logRow.getProjectionLeaseOwner()));
+        columns.put("projection_lease_until", TsColumnValue.of(logRow.getProjectionLeaseUntil()));
+        columns.put("create_time", TsColumnValue.of(logRow.getCreateTime()));
+        return new TsRow(TsPrimaryKey.builder()
+                .add("partition_key", logRow.getPartitionKey())
+                .add("uuid", logRow.getLogUuid())
+                .build(), columns);
+    }
+
     static TsPrimaryKey dataPk(String docCode, String uuid) {
         return TsPrimaryKey.builder()
                 .add("partition_key", PartitionKeys.dataKey(docCode, uuid))
@@ -385,32 +565,12 @@ public class TablestoreDocDataStore implements DocDataStore {
                 .build();
     }
 
-    /** outbox 主键构造：partition_key + event_id */
-    static TsPrimaryKey outboxPk(String partitionKey, String eventId) {
-        return TsPrimaryKey.builder()
-                .add("partition_key", partitionKey)
-                .add("event_id", eventId)
-                .build();
+    static String logUuid(String docUuid, String operationId) {
+        return "op:" + docUuid + ":" + operationId;
     }
 
-    private TsRow historyRow(String partitionKey, String docCode, String uuid, long seq,
-                             Long fromStatus, long toStatus, String operation,
-                             String operator, long operateTime, long versionAfter) {
-        Map<String, TsColumnValue> columns = new LinkedHashMap<>();
-        columns.put("doc_code", TsColumnValue.of(docCode));
-        if (fromStatus != null) {
-            columns.put("from_status", TsColumnValue.of(fromStatus));
-        }
-        columns.put("to_status", TsColumnValue.of(toStatus));
-        columns.put("operation", TsColumnValue.of(operation == null ? "transition" : operation));
-        columns.put("operator", TsColumnValue.of(operator == null ? "anonymous" : operator));
-        columns.put("operate_time", TsColumnValue.of(operateTime));
-        columns.put("version_after", TsColumnValue.of(versionAfter));
-        return new TsRow(TsPrimaryKey.builder()
-                .add("partition_key", partitionKey)
-                .add("uuid", uuid)
-                .add("seq", seq)
-                .build(), columns);
+    private static String eventId(String operationId) {
+        return "evt_" + operationId;
     }
 
     private DocDataRecord mapRow(TsRow row) {
@@ -466,9 +626,25 @@ public class TablestoreDocDataStore implements DocDataStore {
         }
     }
 
-    /**
-     * 流转事务内业务中断（非条件冲突：单据缺失/已删），外层映射 40401。
-     */
+    private static String digest(DocOperationContext context) {
+        String canonical = context.operation() + "|" + context.beforeVersion() + "|"
+                + context.afterVersion() + "|" + context.afterStatus() + "|"
+                + context.eventType() + "|" + context.afterAttributes();
+        try {
+            byte[] hash = MessageDigest.getInstance("SHA-256")
+                    .digest(canonical.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(hash.length * 2);
+            for (byte b : hash) {
+                sb.append(Character.forDigit((b >> 4) & 0xF, 16))
+                        .append(Character.forDigit(b & 0xF, 16));
+            }
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            return UUID.nameUUIDFromBytes(canonical.getBytes(StandardCharsets.UTF_8)).toString();
+        }
+    }
+
+    /** 流转事务内业务中断（非条件冲突：单据缺失/已删），外层映射 40401。 */
     public static class DocTransitionAbortException extends com.example.runtime.domain.port.DocTransitionAbortException {
 
         private static final long serialVersionUID = 1L;
@@ -478,4 +654,3 @@ public class TablestoreDocDataStore implements DocDataStore {
         }
     }
 }
-

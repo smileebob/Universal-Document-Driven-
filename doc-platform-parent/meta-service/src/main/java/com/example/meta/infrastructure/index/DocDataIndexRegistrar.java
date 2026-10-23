@@ -42,11 +42,20 @@ public class DocDataIndexRegistrar {
 
     private final TablestoreTemplate template;
     private final DocSchemaDefinition.Repository docSchemaRepository;
+    private final OnlineIndexPublisher onlineIndexPublisher;
 
     public DocDataIndexRegistrar(TablestoreTemplate template,
                                  DocSchemaDefinition.Repository docSchemaRepository) {
+        this(template, docSchemaRepository, null);
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public DocDataIndexRegistrar(TablestoreTemplate template,
+                                 DocSchemaDefinition.Repository docSchemaRepository,
+                                 OnlineIndexPublisher onlineIndexPublisher) {
         this.template = template;
         this.docSchemaRepository = docSchemaRepository;
+        this.onlineIndexPublisher = onlineIndexPublisher;
     }
 
     /**
@@ -58,18 +67,29 @@ public class DocDataIndexRegistrar {
      */
     public void registerQuietly(List<Map<String, Object>> currentAttributes) {
         try {
-            List<IndexFieldDef> subFields = buildSubFields(unionAttributes(currentAttributes));
-            if (subFields.isEmpty()) {
-                log.info("[index-registrar] doc_data 无 is_searchable 属性，跳过动态注册");
-                return;
-            }
-            SearchIndexDef indexDef = buildIndexDefinition(subFields);
-            template.reconcileSearchIndex(MetaTableNames.DOC_DATA, indexDef);
-            log.info("[index-registrar] doc_data_index 动态子字段注册完成: count={}", subFields.size());
+            registerRequired(currentAttributes);
         } catch (RuntimeException e) {
-            log.warn("[index-registrar] doc_data_index 动态子字段注册失败（不阻断发布，TTL 兜底）: {}",
+            log.warn("[index-registrar] doc_data_index 动态子字段注册失败（不阻断旁路调用）: {}",
                     e.getMessage());
         }
+    }
+
+    /**
+     * 发布前置注册：候选索引创建并切流成功才返回；失败抛异常，发布保持草稿态。
+     */
+    public void registerRequired(List<Map<String, Object>> currentAttributes) {
+        List<IndexFieldDef> subFields = buildSubFields(unionAttributes(currentAttributes));
+        if (subFields.isEmpty()) {
+            log.info("[index-registrar] doc_data 无 is_searchable 属性，跳过动态注册");
+            return;
+        }
+        SearchIndexDef indexDef = buildIndexDefinition(subFields);
+        if (onlineIndexPublisher != null) {
+            onlineIndexPublisher.ensure(MetaTableNames.DOC_DATA, indexDef);
+        } else {
+            template.reconcileSearchIndex(MetaTableNames.DOC_DATA, indexDef);
+        }
+        log.info("[index-registrar] doc_data_index 动态子字段注册完成: count={}", subFields.size());
     }
 
     /**

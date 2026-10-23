@@ -50,6 +50,12 @@ public class SagaExecution {
     /** 更新时间（UTC 毫秒，崩溃恢复扫描依据） */
     private long updateTime;
 
+    /** 恢复/收口租约持有者（空=未认领；多实例防并发推进） */
+    private String leaseOwner;
+
+    /** 租约到期时间（UTC 毫秒） */
+    private long leaseUntil;
+
     public String getSagaId() {
         return sagaId;
     }
@@ -160,5 +166,21 @@ public class SagaExecution {
 
     public void setUpdateTime(long updateTime) {
         this.updateTime = updateTime;
+    }
+
+    public String getLeaseOwner() {
+        return leaseOwner;
+    }
+
+    public void setLeaseOwner(String leaseOwner) {
+        this.leaseOwner = leaseOwner;
+    }
+
+    public long getLeaseUntil() {
+        return leaseUntil;
+    }
+
+    public void setLeaseUntil(long leaseUntil) {
+        this.leaseUntil = leaseUntil;
     }
 }

@@ -180,14 +180,15 @@ public class DocSchemaService {
                     Map.of("reasons", reasons));
         }
         Map<String, Object> before = snapshotOf(definition);
+
+        // 先完成在线索引候选/切流，失败则保持草稿态，避免发布后检索字段缺失
+        docDataIndexRegistrar.registerRequired(definition.getAttributes());
+
         definition.setStatus(DocSchemaDefinition.STATUS_PUBLISHED);
         definition.setPublishedAt(System.currentTimeMillis());
         definition.setUpdateTime(definition.getPublishedAt());
         docSchemaRepository.updateWithVersion(definition);
         definition.setVersion(definition.getVersion() + 1);
-
-        // doc_data_index 多元索引动态子字段注册（幂等，失败 WARN 不阻断，design/03 §4.3）
-        docDataIndexRegistrar.registerQuietly(definition.getAttributes());
 
         // 发布失效链（≤5s）：DEL Redis → 广播 → 全局版本自增
         invalidateCache(code);

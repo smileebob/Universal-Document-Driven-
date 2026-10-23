@@ -56,6 +56,8 @@ import com.alicloud.openservices.tablestore.model.search.ListSearchIndexResponse
 import com.alicloud.openservices.tablestore.model.search.SearchIndexInfo;
 import com.alicloud.openservices.tablestore.model.search.SearchRequest;
 import com.alicloud.openservices.tablestore.model.search.SearchResponse;
+import com.alicloud.openservices.tablestore.model.search.SyncStat;
+import com.alicloud.openservices.tablestore.model.search.UpdateSearchIndexRequest;
 import com.alicloud.openservices.tablestore.model.AbortTransactionRequest;
 import com.alicloud.openservices.tablestore.model.CommitTransactionRequest;
 import com.alicloud.openservices.tablestore.model.StartLocalTransactionRequest;
@@ -808,6 +810,109 @@ public class OtsTablestoreTemplate extends AbstractTablestoreTemplate {
                 + ", index=" + indexDefinition.getName());
     }
 
+    @Override
+    public com.example.common.infrastructure.tablestore.metadata.SearchIndexState describeSearchIndex(
+            String tableName, String indexName) {
+        try {
+            DescribeSearchIndexRequest request = new DescribeSearchIndexRequest();
+            request.setTableName(tableName);
+            request.setIndexName(indexName);
+            DescribeSearchIndexResponse response = client.describeSearchIndex(request);
+            String status = response.getIndexStatus() == null
+                    || response.getIndexStatus().indexStatusEnum == null
+                    ? "UNKNOWN" : response.getIndexStatus().indexStatusEnum.status();
+            SyncStat sync = response.getSyncStat();
+            String phase = sync == null || sync.getSyncPhase() == null
+                    ? null : sync.getSyncPhase().name();
+            Long syncTimestamp = sync == null ? null : sync.getCurrentSyncTimestamp();
+            return new com.example.common.infrastructure.tablestore.metadata.SearchIndexState(
+                    indexName, true, status, phase, syncTimestamp,
+                    response.getBrotherIndexName());
+        } catch (TableStoreException e) {
+            if ("OTSObjectNotExist".equals(e.getErrorCode())
+                    || "OTSObjectNotExist".equalsIgnoreCase(e.getErrorCode())) {
+                return new com.example.common.infrastructure.tablestore.metadata.SearchIndexState(
+                        indexName, false, null, null, null, null);
+            }
+            throw translate(e, "DescribeSearchIndex: table=" + tableName
+                    + ", index=" + indexName);
+        }
+    }
+
+    @Override
+    public boolean isSearchIndexCovered(String tableName, SearchIndexDef indexDefinition) {
+        if (!searchIndexExists(tableName, indexDefinition.getName())) {
+            return false;
+        }
+        DescribeSearchIndexRequest request = new DescribeSearchIndexRequest();
+        request.setTableName(tableName);
+        request.setIndexName(indexDefinition.getName());
+        try {
+            return isSchemaCovered(client.describeSearchIndex(request).getSchema(), indexDefinition);
+        } catch (TableStoreException e) {
+            if ("OTSObjectNotExist".equals(e.getErrorCode())) {
+                return false;
+            }
+            throw translate(e, "DescribeSearchIndex(coverage): table=" + tableName
+                    + ", index=" + indexDefinition.getName());
+        }
+    }
+
+    @Override
+    public void createSearchIndexIfAbsent(String tableName, SearchIndexDef indexDefinition) {
+        ensureSearchIndex(tableName, indexDefinition);
+    }
+
+    @Override
+    public void createBrotherSearchIndex(String tableName, String sourceIndex,
+                                         SearchIndexDef candidateDefinition) {
+        try {
+            if (searchIndexExists(tableName, candidateDefinition.getName())) {
+                return;
+            }
+            doCreateSearchIndex(tableName, candidateDefinition, sourceIndex);
+        } catch (TableStoreException e) {
+            if ("OTSObjectAlreadyExist".equals(e.getErrorCode())) {
+                return;
+            }
+            throw translate(e, "CreateSearchIndex(brother): table=" + tableName
+                    + ", source=" + sourceIndex + ", candidate=" + candidateDefinition.getName());
+        }
+    }
+
+    @Override
+    public void switchSearchIndex(String tableName, String logicalIndex, String candidateIndex) {
+        try {
+            UpdateSearchIndexRequest request = new UpdateSearchIndexRequest(tableName, logicalIndex);
+            request.setSwitchIndexName(candidateIndex);
+            client.updateSearchIndex(request);
+            log.info("[tablestore][index-switch] 已切换索引路由: {}.{} -> {}",
+                    tableName, logicalIndex, candidateIndex);
+        } catch (TableStoreException e) {
+            throw translate(e, "UpdateSearchIndex(switch): table=" + tableName
+                    + ", logical=" + logicalIndex + ", candidate=" + candidateIndex);
+        }
+    }
+
+    @Override
+    public void deleteSearchIndexIfExists(String tableName, String indexName) {
+        if (!searchIndexExists(tableName, indexName)) {
+            return;
+        }
+        try {
+            DeleteSearchIndexRequest request = new DeleteSearchIndexRequest();
+            request.setTableName(tableName);
+            request.setIndexName(indexName);
+            client.deleteSearchIndex(request);
+            log.info("[tablestore][index-cleanup] 已删除索引: {}.{}", tableName, indexName);
+        } catch (TableStoreException e) {
+            if ("OTSObjectNotExist".equals(e.getErrorCode())) {
+                return;
+            }
+            throw translate(e, "DeleteSearchIndex: table=" + tableName + ", index=" + indexName);
+        }
+    }
+
     /** 索引存在性判定（ListSearchIndex 按名匹配） */
     private boolean searchIndexExists(String tableName, String indexName) {
         ListSearchIndexRequest listRequest = new ListSearchIndexRequest();
@@ -825,6 +930,11 @@ public class OtsTablestoreTemplate extends AbstractTablestoreTemplate {
      * TTL 表（如 audit_log/event_outbox）会因索引 forever 被拒（OTSParameterInvalid）。</p>
      */
     private void doCreateSearchIndex(String tableName, SearchIndexDef indexDefinition) {
+        doCreateSearchIndex(tableName, indexDefinition, null);
+    }
+
+    private void doCreateSearchIndex(String tableName, SearchIndexDef indexDefinition,
+                                     String sourceIndexName) {
         CreateSearchIndexRequest request = new CreateSearchIndexRequest();
         request.setTableName(tableName);
         request.setIndexName(indexDefinition.getName());
@@ -833,6 +943,10 @@ public class OtsTablestoreTemplate extends AbstractTablestoreTemplate {
                 .map(OtsTablestoreTemplate::toFieldSchema)
                 .collect(Collectors.toList()));
         request.setIndexSchema(schema);
+        if (sourceIndexName != null && !sourceIndexName.isBlank()) {
+            // 只有 sourceIndexName 创建的兄弟索引才能被 switchIndexName 切流
+            request.setSourceIndexName(sourceIndexName);
+        }
         long tableTtlSeconds = getMetadataRegistry().get(tableName)
                 .map(TableDefinition::getTtlSeconds)
                 .orElse(TableDefinition.TTL_FOREVER);
@@ -840,8 +954,9 @@ public class OtsTablestoreTemplate extends AbstractTablestoreTemplate {
             request.setTimeToLive((int) tableTtlSeconds, TimeUnit.SECONDS);
         }
         client.createSearchIndex(request);
-        log.info("[tablestore][bootstrap] 建多元索引成功: {}.{}（索引TTL={}）", tableName,
+        log.info("[tablestore][bootstrap] 建多元索引成功: {}.{}{}（索引TTL={}）", tableName,
                 indexDefinition.getName(),
+                sourceIndexName == null ? "" : "(brother of " + sourceIndexName + ")",
                 tableTtlSeconds > 0 ? tableTtlSeconds + "s" : "forever");
     }
 

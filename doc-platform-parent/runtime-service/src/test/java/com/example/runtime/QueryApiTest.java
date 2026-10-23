@@ -103,6 +103,46 @@ class QueryApiTest {
         seedData();
     }
 
+    @Test
+    @DisplayName("doc_data 查询：日志行不可见，内部列（record_kind/inflight/last_event_seq）不出参")
+    void docQuery_excludesLogRowsAndInternalColumns() throws Exception {
+        String uuid = "doc-business-1";
+        String partitionKey = PartitionKeys.dataKey("probe_doc", uuid);
+        Map<String, TsColumnValue> business = new java.util.LinkedHashMap<>();
+        business.put("doc_code", TsColumnValue.of("probe_doc"));
+        business.put("current_status", TsColumnValue.of(100L));
+        business.put("deleted", TsColumnValue.of(0L));
+        business.put("attributes", TsColumnValue.of("{}"));
+        business.put("relations", TsColumnValue.of("[]"));
+        business.put("record_kind", TsColumnValue.of(0L));
+        business.put("last_event_seq", TsColumnValue.of(1L));
+        business.put("inflight_operation_id", TsColumnValue.of(""));
+        business.put("inflight_saga_id", TsColumnValue.of(""));
+        business.put("inflight_lease_until", TsColumnValue.of(0L));
+        business.put("create_time", TsColumnValue.of(System.currentTimeMillis()));
+        template.putRow("doc_data", new TsRow(TsPrimaryKey.builder()
+                .add("partition_key", partitionKey).add("uuid", uuid).build(), business));
+        Map<String, TsColumnValue> logRow = new java.util.LinkedHashMap<>();
+        logRow.put("doc_code", TsColumnValue.of("probe_doc"));
+        logRow.put("current_status", TsColumnValue.of(100L));
+        logRow.put("deleted", TsColumnValue.of(1L));
+        logRow.put("record_kind", TsColumnValue.of(1L));
+        logRow.put("create_time", TsColumnValue.of(System.currentTimeMillis()));
+        template.putRow("doc_data", new TsRow(TsPrimaryKey.builder()
+                .add("partition_key", partitionKey)
+                .add("uuid", "op:" + uuid + ":op-1").build(), logRow));
+
+        mockMvc.perform(post("/api/v1/query")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"target\":\"doc_data\",\"page\":{\"limit\":10}}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.total").value(1))
+                .andExpect(jsonPath("$.data.items[0].uuid").value(uuid))
+                .andExpect(jsonPath("$.data.items[0].record_kind").doesNotExist())
+                .andExpect(jsonPath("$.data.items[0].last_event_seq").doesNotExist())
+                .andExpect(jsonPath("$.data.items[0].inflight_operation_id").doesNotExist());
+    }
+
     /** 种子数据：2 部门 + 5 客户（其中 1 个逻辑删），level 分布 1/2/3/3/5 */
     private void seedData() {
         dept1 = (String) dataService.create("department", Map.of("name", "研发部"),

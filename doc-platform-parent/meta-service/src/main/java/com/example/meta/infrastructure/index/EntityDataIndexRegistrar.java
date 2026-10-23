@@ -46,10 +46,20 @@ public class EntityDataIndexRegistrar {
 
     private final TablestoreTemplate template;
     private final EntitySchemaRepository schemaRepository;
+    private final OnlineIndexPublisher onlineIndexPublisher;
 
-    public EntityDataIndexRegistrar(TablestoreTemplate template, EntitySchemaRepository schemaRepository) {
+    public EntityDataIndexRegistrar(TablestoreTemplate template,
+                                    EntitySchemaRepository schemaRepository) {
+        this(template, schemaRepository, null);
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public EntityDataIndexRegistrar(TablestoreTemplate template,
+                                    EntitySchemaRepository schemaRepository,
+                                    OnlineIndexPublisher onlineIndexPublisher) {
         this.template = template;
         this.schemaRepository = schemaRepository;
+        this.onlineIndexPublisher = onlineIndexPublisher;
     }
 
     /**
@@ -60,17 +70,28 @@ public class EntityDataIndexRegistrar {
      */
     public void registerQuietly(List<AttributeDef> currentAttributes) {
         try {
-            List<IndexFieldDef> subFields = buildSubFields(unionAttributes(currentAttributes));
-            if (subFields.isEmpty()) {
-                log.info("[index-registrar] 无 is_searchable 属性，跳过动态注册");
-                return;
-            }
-            SearchIndexDef indexDef = buildIndexDefinition(subFields);
-            template.reconcileSearchIndex(MetaTableNames.ENTITY_DATA, indexDef);
-            log.info("[index-registrar] entity_data_index 动态子字段注册完成: count={}", subFields.size());
+            registerRequired(currentAttributes);
         } catch (RuntimeException e) {
-            log.warn("[index-registrar] 动态子字段注册失败（不阻断发布，TTL 兜底）: {}", e.getMessage());
+            log.warn("[index-registrar] 动态子字段注册失败（不阻断旁路调用）: {}", e.getMessage());
         }
+    }
+
+    /**
+     * 发布前置注册：候选索引创建并切流成功才返回；失败抛异常，发布保持草稿态。
+     */
+    public void registerRequired(List<AttributeDef> currentAttributes) {
+        List<IndexFieldDef> subFields = buildSubFields(unionAttributes(currentAttributes));
+        if (subFields.isEmpty()) {
+            log.info("[index-registrar] 无 is_searchable 属性，跳过动态注册");
+            return;
+        }
+        SearchIndexDef indexDef = buildIndexDefinition(subFields);
+        if (onlineIndexPublisher != null) {
+            onlineIndexPublisher.ensure(MetaTableNames.ENTITY_DATA, indexDef);
+        } else {
+            template.reconcileSearchIndex(MetaTableNames.ENTITY_DATA, indexDef);
+        }
+        log.info("[index-registrar] entity_data_index 动态子字段注册完成: count={}", subFields.size());
     }
 
     /**

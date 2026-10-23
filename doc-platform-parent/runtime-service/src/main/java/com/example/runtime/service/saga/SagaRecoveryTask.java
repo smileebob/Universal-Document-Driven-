@@ -13,24 +13,24 @@ import org.slf4j.MDC;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import com.example.common.constants.DocMqConstants;
 import com.example.runtime.domain.model.DocDataRecord;
+import com.example.runtime.domain.model.DocOperationContext;
 import com.example.runtime.domain.port.DocDataStore;
 import com.example.runtime.domain.saga.SagaExecution;
 import com.example.runtime.domain.saga.SagaStatus;
 import com.example.runtime.domain.saga.SagaStore;
+import com.example.runtime.service.event.DocOperationProjector;
 
 /**
- * Saga 崩溃恢复任务（TX-03）：
- * <ul>
- *   <li>EXECUTING 超阈值：续推剩余外部步骤；</li>
- *   <li>ACTIONS_SUCCEEDED 超阈值：外部步骤已完成但本地提交结果未知。
- *       单据已到目标状态 → 标记 COMPLETED；仍为起始状态且版本等于快照版本
- *       → 幂等提交本地事务；其余情况 → 逆序冲正外部步骤（失败转死信）。</li>
- * </ul>
+ * Saga 崩溃恢复任务（TX-03/TX-04）。
  *
- * <p>saga_execution 无索引，按 getRange 全表扫描（行数百级）；单实例内
- * AtomicBoolean 防重叠。多实例通过单据版本 CAS、提交后二次读状态与
- * 幂等冲正收敛：提交竞争失败方若发现单据已到目标状态，只补收口不冲正。</p>
+ * <ul>
+ *   <li>EXECUTING：续推剩余步骤；最近一步结果未知时转补偿（不重复执行）；</li>
+ *   <li>ACTIONS_SUCCEEDED / COMMIT_PENDING：按单据版本/状态补提交或冲正；</li>
+ *   <li>COMPENSATING：继续补偿；超时/未知转 MANUAL_REQUIRED，不假装回滚；</li>
+ *   <li>多实例：先以 status + lease_owner + update_time CAS 认领租约，再推进。</li>
+ * </ul>
  */
 @Component
 public class SagaRecoveryTask {
@@ -41,21 +41,23 @@ public class SagaRecoveryTask {
     private final SagaOrchestrator orchestrator;
     private final SagaProperties properties;
     private final DocDataStore docDataStore;
+    private final DocOperationProjector projector;
 
-    /** 重叠执行防护（上一轮未结束则跳过本轮） */
+    private final String instanceId = "saga-recovery-"
+            + UUID.randomUUID().toString().substring(0, 8);
+
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     public SagaRecoveryTask(SagaStore sagaStore, SagaOrchestrator orchestrator,
-                            SagaProperties properties, DocDataStore docDataStore) {
+                            SagaProperties properties, DocDataStore docDataStore,
+                            DocOperationProjector projector) {
         this.sagaStore = sagaStore;
         this.orchestrator = orchestrator;
         this.properties = properties;
         this.docDataStore = docDataStore;
+        this.projector = projector;
     }
 
-    /**
-     * 每 60s 扫描一轮滞留 EXECUTING（update_time ≤ now-5min）。
-     */
     @Scheduled(fixedDelayString = "${doc.runtime.saga.recovery-interval-ms:60000}",
             initialDelayString = "${doc.runtime.saga.recovery-interval-ms:60000}")
     public void recover() {
@@ -70,38 +72,31 @@ public class SagaRecoveryTask {
         try {
             long threshold = System.currentTimeMillis() - properties.getStuckThresholdMs();
             Set<String> processed = new HashSet<>();
-            List<SagaExecution> executing = sagaStore.scanStuckExecuting(threshold);
-            if (!executing.isEmpty()) {
-                log.warn("[saga-recovery] 发现滞留 EXECUTING 记录: count={}", executing.size());
+            List<SagaExecution> candidates = sagaStore.scanNonTerminal(threshold);
+            if (!candidates.isEmpty()) {
+                log.warn("[saga-recovery] 发现非终态记录: count={}", candidates.size());
             }
-            for (SagaExecution execution : executing) {
-                try {
-                    orchestrator.resumeStuck(execution);
-                    SagaExecution latest = sagaStore.find(execution.getSagaId()).orElse(null);
-                    if (latest != null && latest.getStatus() == SagaStatus.ACTIONS_SUCCEEDED) {
-                        recoverActionsSucceeded(latest);
-                        processed.add(latest.getSagaId());
-                    }
-                } catch (RuntimeException e) {
-                    log.error("[saga-recovery] 续推失败（下轮重试）: sagaId={}",
-                            execution.getSagaId(), e);
+            for (SagaExecution candidate : candidates) {
+                if (!processed.add(candidate.getSagaId())) {
+                    continue;
                 }
-            }
-
-            List<SagaExecution> pendingCommit = sagaStore.scanActionsSucceeded(threshold);
-            if (!pendingCommit.isEmpty()) {
-                log.warn("[saga-recovery] 发现待收口 ACTIONS_SUCCEEDED 记录: count={}",
-                        pendingCommit.size());
-            }
-            for (SagaExecution execution : pendingCommit) {
-                if (!processed.add(execution.getSagaId())) {
+                long now = System.currentTimeMillis();
+                if (candidate.getLeaseUntil() > now
+                        && candidate.getLeaseOwner() != null
+                        && !candidate.getLeaseOwner().isBlank()) {
+                    continue;
+                }
+                if (!sagaStore.claim(candidate, instanceId,
+                        now + properties.getLeaseMs(), candidate.getUpdateTime())) {
                     continue;
                 }
                 try {
-                    recoverActionsSucceeded(execution);
+                    recoverOne(candidate, processed);
                 } catch (RuntimeException e) {
-                    log.error("[saga-recovery] 待提交 Saga 收口失败（下轮重试）: sagaId={}",
-                            execution.getSagaId(), e);
+                    log.error("[saga-recovery] 恢复失败（下轮重试）: sagaId={}",
+                            candidate.getSagaId(), e);
+                } finally {
+                    releaseLease(candidate.getSagaId());
                 }
             }
         } finally {
@@ -110,8 +105,29 @@ public class SagaRecoveryTask {
         }
     }
 
+    private void recoverOne(SagaExecution claimed, Set<String> processed) {
+        SagaExecution execution = sagaStore.find(claimed.getSagaId()).orElse(claimed);
+        SagaStatus status = execution.getStatus();
+        if (status == SagaStatus.EXECUTING) {
+            orchestrator.resumeStuck(execution);
+        } else if (status == SagaStatus.COMPENSATING) {
+            orchestrator.resumeCompensation(execution);
+        } else if (status == SagaStatus.ACTIONS_SUCCEEDED
+                || status == SagaStatus.COMMIT_PENDING) {
+            recoverActionsSucceeded(execution);
+            return;
+        }
+        SagaExecution latest = sagaStore.find(execution.getSagaId()).orElse(execution);
+        if ((latest.getStatus() == SagaStatus.ACTIONS_SUCCEEDED
+                || latest.getStatus() == SagaStatus.COMMIT_PENDING)
+                && processed.add(latest.getSagaId() + ":commit")) {
+            recoverActionsSucceeded(latest);
+        }
+    }
+
     /**
-     * 收口 ACTIONS_SUCCEEDED：根据单据当前状态/版本决定补提交、标记完成或冲正。
+     * 收口 ACTIONS_SUCCEEDED / COMMIT_PENDING：根据单据当前状态/版本决定补提交、
+     * 标记完成或冲正。
      */
     private void recoverActionsSucceeded(SagaExecution execution) {
         String sagaId = execution.getSagaId();
@@ -129,11 +145,20 @@ public class SagaRecoveryTask {
         }
         if (record.getCurrentStatus() == execution.getFromStatus()
                 && record.getVersion() == execution.getExpectedVersion()) {
+            long occurredAt = System.currentTimeMillis();
+            DocOperationContext context = new DocOperationContext(sagaId,
+                    DocOperationContext.OP_TRANSITION, execution.getOperator(),
+                    execution.getTraceId(), sagaId, "saga-recovery",
+                    DocMqConstants.EventTypes.DOC_STATUS_CHANGED, 0L,
+                    execution.getExpectedVersion(), execution.getFromStatus(),
+                    record.getAttributes(), execution.getExpectedVersion() + 1,
+                    execution.getToStatus(), record.getAttributes(),
+                    record.getRelations(), false, occurredAt);
             try {
                 docDataStore.commitTransition(execution.getDocCode(), execution.getDocUuid(),
                         execution.getExpectedVersion(), execution.getFromStatus(),
-                        execution.getToStatus(), execution.getOperator(),
-                        "saga-recovery", sagaId);
+                        execution.getToStatus(), context);
+                projector.projectNow(execution.getDocCode(), execution.getDocUuid(), sagaId);
                 orchestrator.markCommitted(sagaId);
                 log.info("[saga-recovery] 待提交 Saga 已完成本地提交: sagaId={}", sagaId);
             } catch (RuntimeException e) {
@@ -159,19 +184,31 @@ public class SagaRecoveryTask {
         String sagaId = execution.getSagaId();
         try {
             SagaStatus status = orchestrator.compensateAfterCommitFailure(sagaId);
-            if (status == SagaStatus.DEAD) {
-                log.error("[saga-recovery][ALERT] 待提交 Saga 冲正失败转死信，需人工处置: "
-                        + "sagaId={}, reason={}", sagaId, reason);
-            } else if (status == SagaStatus.COMPENSATED) {
-                log.warn("[saga-recovery] 待提交 Saga 已冲正: sagaId={}, reason={}",
+            if (status == SagaStatus.COMPENSATED) {
+                docDataStore.releaseOperation(execution.getDocCode(), execution.getDocUuid(),
+                        sagaId, System.currentTimeMillis());
+                log.warn("[saga-recovery] 待提交 Saga 已冲正并释放在途锁: sagaId={}, reason={}",
                         sagaId, reason);
+            } else if (status == SagaStatus.DEAD || status == SagaStatus.MANUAL_REQUIRED) {
+                log.error("[saga-recovery][ALERT] 待提交 Saga 冲正失败/未知转人工"
+                        + "（保留在途锁）: sagaId={}, status={}, reason={}",
+                        sagaId, status, reason);
             } else {
-                log.error("[saga-recovery] 待提交 Saga 冲正状态未知，需人工核对: "
+                log.error("[saga-recovery] 待提交 Saga 冲正状态未收敛，需人工核对: "
                         + "sagaId={}, status={}, reason={}", sagaId, status, reason);
             }
         } catch (RuntimeException e) {
             log.error("[saga-recovery][ALERT] 待提交 Saga 冲正异常，需人工核对: sagaId={}, reason={}",
                     sagaId, reason, e);
+        }
+    }
+
+    /** 释放恢复租约（不改变业务状态）。 */
+    private void releaseLease(String sagaId) {
+        try {
+            sagaStore.releaseLease(sagaId, instanceId, System.currentTimeMillis());
+        } catch (RuntimeException e) {
+            log.warn("[saga-recovery] 租约释放失败（到期自动失效）: sagaId={}", sagaId, e);
         }
     }
 }

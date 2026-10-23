@@ -234,4 +234,30 @@ public interface TablestoreTemplate {
      * @param indexDefinition 期望的完整索引定义（基线列 + Nested 子字段）
      */
     void reconcileSearchIndex(String tableName, SearchIndexDef indexDefinition);
+
+    /** 查询多元索引状态（不存在返回 exists=false）。 */
+    com.example.common.infrastructure.tablestore.metadata.SearchIndexState describeSearchIndex(
+            String tableName, String indexName);
+
+    /** 既有索引字段是否覆盖期望定义（不存在返回 false）。 */
+    boolean isSearchIndexCovered(String tableName, SearchIndexDef indexDefinition);
+
+    /** 创建异名候选索引（存在即幂等跳过）。 */
+    void createSearchIndexIfAbsent(String tableName, SearchIndexDef indexDefinition);
+
+    /**
+     * 创建逻辑索引的“兄弟索引”（OTS CreateSearchIndex.sourceIndexName）。
+     * 只有兄弟索引才可被 UpdateSearchIndex.switchIndexName 切流。
+     */
+    void createBrotherSearchIndex(String tableName, String sourceIndex,
+                                  SearchIndexDef candidateDefinition);
+
+    /**
+     * 在线切流：把 logicalIndex 的查询路由切换到 candidateIndex
+     * （OTS UpdateSearchIndex.switchIndexName）。旧物理索引作为兄弟索引保留。
+     */
+    void switchSearchIndex(String tableName, String logicalIndex, String candidateIndex);
+
+    /** 删除多元索引（清理回滚窗口后的旧索引；不存在即幂等）。 */
+    void deleteSearchIndexIfExists(String tableName, String indexName);
 }
