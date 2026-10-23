@@ -118,7 +118,7 @@ public class StateMachineService {
         config.setVersion(config.getVersion() + 1);
 
         // 保存即时失效（复用发布失效链）：DEL Redis → 广播 CONFIG_CHANGED
-        cacheService.evict(CacheKeyBuilder.stateMachine(docCode));
+        cacheService.invalidateShared(CacheKeyBuilder.stateMachine(docCode));
         invalidationPublisher.publish(SchemaInvalidationEvent.configChanged(
                 CacheDomains.STATE_MACHINE, docCode, config.getVersion()));
         bumpGlobalVersion();
@@ -155,13 +155,13 @@ public class StateMachineService {
         boolean locked = lockToken != null;
         try {
             if (locked) {
-                long rebuildStart = System.nanoTime();
+                CacheService.CacheStamp stamp = cacheService.beginRebuild(key, true);
                 StateMachineDTO dto = load(docCode);
                 if (dto == null) {
-                    cacheService.putNull(key);
+                    cacheService.finishRebuildNull(key, stamp, true);
                     throw notConfigured(docCode);
                 }
-                cacheService.putIfNotEvicted(key, toJson(dto), rebuildStart);
+                cacheService.finishRebuild(key, toJson(dto), stamp, true);
                 return dto;
             }
             for (int i = 0; i < cacheService.rebuildMaxWaits(); i++) {

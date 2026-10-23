@@ -203,7 +203,7 @@ class SchemaServiceTest {
         assertThat(published.getPublishedAt()).isNotNull();
         verify(schemaRepository).updateWithVersion(published);
         verify(indexRegistrar).registerQuietly(anyList());
-        verify(cacheService).evict(CacheKeyBuilder.entitySchema("customer"));
+        verify(cacheService).invalidateShared(CacheKeyBuilder.entitySchema("customer"));
         ArgumentCaptor<SchemaInvalidationEvent> captor =
                 ArgumentCaptor.forClass(SchemaInvalidationEvent.class);
         verify(publisher).publish(captor.capture());
@@ -239,8 +239,8 @@ class SchemaServiceTest {
         assertThat(disabled.getStatus()).isEqualTo(EntityStatus.DISABLED);
         assertThat(entry.isEnabled()).isFalse();
         verify(menuConfigRepository).save(entry);
-        verify(cacheService).evict(CacheKeyBuilder.menuTree());
-        verify(cacheService).evict(CacheKeyBuilder.entitySchema("customer"));
+        verify(cacheService).invalidateShared(CacheKeyBuilder.menuTree());
+        verify(cacheService).invalidateShared(CacheKeyBuilder.entitySchema("customer"));
         verify(publisher).publish(any(SchemaInvalidationEvent.class));
 
         when(schemaRepository.findByCode("draft_entity"))
@@ -331,7 +331,7 @@ class SchemaServiceTest {
                 .thenReturn(Optional.of(schema("customer", EntityStatus.PUBLISHED, 1)));
 
         assertThat(service.getPublishedDto("customer").getCode()).isEqualTo("customer");
-        verify(cacheService).putIfNotEvicted(anyString(), anyString(), anyLong());
+        verify(cacheService).finishRebuild(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyBoolean());
         verify(cacheService).releaseRebuildLock(anyString(), anyString());
 
         // 未发布 → 空值占位 + 40401
@@ -341,7 +341,7 @@ class SchemaServiceTest {
         assertThatThrownBy(() -> service.getPublishedDto("draft_only"))
                 .isInstanceOf(BizException.class)
                 .extracting(e -> ((BizException) e).getCode()).isEqualTo(40401);
-        verify(cacheService).putNull(CacheKeyBuilder.entitySchema("draft_only"));
+        verify(cacheService).finishRebuildNull(org.mockito.ArgumentMatchers.eq(CacheKeyBuilder.entitySchema("draft_only")), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.eq(true));
     }
 
     @Test
@@ -355,7 +355,7 @@ class SchemaServiceTest {
                 .thenReturn(Optional.of(schema("customer", EntityStatus.PUBLISHED, 1)));
 
         assertThat(service.getPublishedDto("customer").getCode()).isEqualTo("customer");
-        verify(cacheService, never()).putIfNotEvicted(anyString(), anyString(), anyLong());
+        verify(cacheService, never()).finishRebuild(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyBoolean());
     }
 
     @Test
@@ -366,7 +366,7 @@ class SchemaServiceTest {
                 schema("draft_entity", EntityStatus.DRAFT, 0)));
         assertThat(service.listPublishedDtos()).hasSize(1);
         service.warmup();
-        verify(cacheService).put(anyString(), anyString());
+        verify(cacheService).putShared(anyString(), anyString());
     }
 
     @Test

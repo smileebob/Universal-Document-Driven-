@@ -43,7 +43,7 @@ class SchemaInvalidationHandlerTest {
     @DisplayName("合法消息：DEL 对应缓存键（BC-01 幂等）")
     void handle_validMessage_evictsKey() {
         handler().handle(message("entity_schema", "customer", 5));
-        verify(cacheService).evict(CacheKeyBuilder.entitySchema("customer"));
+        verify(cacheService).evictLocalOnly(CacheKeyBuilder.entitySchema("customer"));
     }
 
     @Test
@@ -52,35 +52,35 @@ class SchemaInvalidationHandlerTest {
         SchemaInvalidationHandler handler = handler();
         handler.handle(message("entity_schema", "customer", 5));
         handler.handle(message("entity_schema", "customer", 3));
-        verify(cacheService, times(1)).evict(CacheKeyBuilder.entitySchema("customer"));
+        verify(cacheService, times(1)).evictLocalOnly(CacheKeyBuilder.entitySchema("customer"));
     }
 
     @Test
     @DisplayName("menu_config 域映射到全局菜单树键")
     void handle_menuDomain_menuTreeKey() {
         handler().handle(message("menu_config", "entity_customer", 2));
-        verify(cacheService).evict(CacheKeyBuilder.menuTree());
+        verify(cacheService).evictLocalOnly(CacheKeyBuilder.menuTree());
     }
 
     @Test
     @DisplayName("缺少 cache_domain 的消息丢弃，不触发失效")
     void handle_missingDomain_dropped() {
         handler().handle("{\"event_id\":\"e1\",\"payload\":{\"code\":\"x\",\"version\":1}}");
-        verify(cacheService, never()).evict(org.mockito.ArgumentMatchers.anyString());
+        verify(cacheService, never()).evictLocalOnly(org.mockito.ArgumentMatchers.anyString());
     }
 
     @Test
     @DisplayName("未知缓存域忽略，不触发失效")
     void handle_unknownDomain_ignored() {
         handler().handle(message("unknown_domain", "x", 1));
-        verify(cacheService, never()).evict(org.mockito.ArgumentMatchers.anyString());
+        verify(cacheService, never()).evictLocalOnly(org.mockito.ArgumentMatchers.anyString());
     }
 
     @Test
     @DisplayName("BC-04：非法 JSON 仅 WARN，不抛异常")
     void handle_invalidJson_noThrow() {
         handler().handle("{invalid-json");
-        verify(cacheService, never()).evict(org.mockito.ArgumentMatchers.anyString());
+        verify(cacheService, never()).evictLocalOnly(org.mockito.ArgumentMatchers.anyString());
     }
 
     @Test

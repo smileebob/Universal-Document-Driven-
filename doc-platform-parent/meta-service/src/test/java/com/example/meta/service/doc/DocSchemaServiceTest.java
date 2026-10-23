@@ -250,7 +250,7 @@ class DocSchemaServiceTest {
         assertThat(published.getPublishedAt()).isNotNull();
         verify(docSchemaRepository).updateWithVersion(published);
         verify(docDataIndexRegistrar).registerQuietly(published.getAttributes());
-        verify(cacheService).evict(CacheKeyBuilder.docSchema("po"));
+        verify(cacheService).invalidateShared(CacheKeyBuilder.docSchema("po"));
         ArgumentCaptor<SchemaInvalidationEvent> captor =
                 ArgumentCaptor.forClass(SchemaInvalidationEvent.class);
         verify(publisher).publish(captor.capture());
@@ -365,7 +365,7 @@ class DocSchemaServiceTest {
         DocSchemaDefinition disabled = service.disable("po");
         assertThat(disabled.getStatus()).isEqualTo(DocSchemaDefinition.STATUS_DISABLED);
         assertThat(disabled.getVersion()).isEqualTo(2L);
-        verify(cacheService).evict(CacheKeyBuilder.docSchema("po"));
+        verify(cacheService).invalidateShared(CacheKeyBuilder.docSchema("po"));
         verify(publisher).publish(any(SchemaInvalidationEvent.class));
         verify(configAuditService).recordConfig(eq("doc_schema"), eq("po"), eq("disable"), any(), any());
 
@@ -475,7 +475,7 @@ class DocSchemaServiceTest {
                 .thenReturn(Optional.of(definition("po", DocSchemaDefinition.STATUS_PUBLISHED, 1)));
 
         assertThat(service.getPublishedDto("po").getCode()).isEqualTo("po");
-        verify(cacheService).putIfNotEvicted(anyString(), anyString(), anyLong());
+        verify(cacheService).finishRebuild(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyBoolean());
         verify(cacheService).releaseRebuildLock(anyString(), anyString());
 
         when(cacheService.get(CacheKeyBuilder.docSchema("draft_only"))).thenReturn(null);
@@ -484,7 +484,7 @@ class DocSchemaServiceTest {
         assertThatThrownBy(() -> service.getPublishedDto("draft_only"))
                 .isInstanceOf(BizException.class)
                 .extracting(e -> ((BizException) e).getCode()).isEqualTo(40401);
-        verify(cacheService).putNull(CacheKeyBuilder.docSchema("draft_only"));
+        verify(cacheService).finishRebuildNull(org.mockito.ArgumentMatchers.eq(CacheKeyBuilder.docSchema("draft_only")), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.eq(true));
     }
 
     @Test
@@ -497,7 +497,7 @@ class DocSchemaServiceTest {
         when(docSchemaRepository.findByCode("po"))
                 .thenReturn(Optional.of(definition("po", DocSchemaDefinition.STATUS_PUBLISHED, 1)));
         assertThat(service.getPublishedDto("po").getCode()).isEqualTo("po");
-        verify(cacheService, never()).putIfNotEvicted(anyString(), anyString(), anyLong());
+        verify(cacheService, never()).finishRebuild(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyBoolean());
 
         // 轮询期间缓存被他人回填 → 直接命中返回
         when(cacheService.get(CacheKeyBuilder.docSchema("po2")))
@@ -521,7 +521,7 @@ class DocSchemaServiceTest {
                 definition("draft_doc", DocSchemaDefinition.STATUS_DRAFT, 0)));
         assertThat(service.listPublishedDtos()).hasSize(1);
         service.warmup();
-        verify(cacheService).put(eq(CacheKeyBuilder.docSchema("pub_doc")), anyString());
+        verify(cacheService).putShared(eq(CacheKeyBuilder.docSchema("pub_doc")), anyString());
     }
 
     @Test

@@ -128,7 +128,7 @@ class MenuServiceTest {
         assertThat(saved.getGroupCode()).isEqualTo("basic_data");
         assertThat(saved.isEnabled()).isTrue();
         verify(menuConfigRepository).save(saved);
-        verify(cacheService).evict(CacheKeyBuilder.menuTree());
+        verify(cacheService).invalidateShared(CacheKeyBuilder.menuTree());
         ArgumentCaptor<SchemaInvalidationEvent> captor =
                 ArgumentCaptor.forClass(SchemaInvalidationEvent.class);
         verify(publisher).publish(captor.capture());
@@ -142,7 +142,6 @@ class MenuServiceTest {
     void mounted_filtersAndGroups() {
         when(cacheService.get(CacheKeyBuilder.menuTree())).thenReturn(null);
         when(cacheService.tryRebuildLock(anyString())).thenReturn("lock-token");
-        when(cacheService.putIfNotEvicted(anyString(), anyString(), anyLong())).thenReturn(true);
         when(menuConfigRepository.getSchemaVersion()).thenReturn(5L);
         when(menuConfigRepository.findAll()).thenReturn(List.of(
                 entry("entity", "customer", "basic_data", 2L, true),
@@ -169,7 +168,7 @@ class MenuServiceTest {
         assertThat(view.getItems())
                 .extracting(MenuMountedView.MenuItem::getGroupCode)
                 .containsExactly("basic_data", "basic_data", "biz_doc");
-        verify(cacheService).putIfNotEvicted(anyString(), anyString(), anyLong());
+        verify(cacheService).finishRebuild(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyBoolean());
     }
 
     @Test
@@ -177,7 +176,6 @@ class MenuServiceTest {
     void mounted_docPublished_listed() {
         when(cacheService.get(CacheKeyBuilder.menuTree())).thenReturn(null);
         when(cacheService.tryRebuildLock(anyString())).thenReturn("lock-token");
-        when(cacheService.putIfNotEvicted(anyString(), anyString(), anyLong())).thenReturn(true);
         when(menuConfigRepository.getSchemaVersion()).thenReturn(5L);
         when(menuConfigRepository.findAll()).thenReturn(List.of(
                 entry("doc", "export_order", "biz_doc", 1L, true)));
@@ -200,7 +198,6 @@ class MenuServiceTest {
     void mounted_docUnpublished_filtered() {
         when(cacheService.get(CacheKeyBuilder.menuTree())).thenReturn(null);
         when(cacheService.tryRebuildLock(anyString())).thenReturn("lock-token");
-        when(cacheService.putIfNotEvicted(anyString(), anyString(), anyLong())).thenReturn(true);
         when(menuConfigRepository.getSchemaVersion()).thenReturn(5L);
         when(menuConfigRepository.findAll()).thenReturn(List.of(
                 entry("doc", "draft_doc", "biz_doc", 1L, true)));
@@ -215,7 +212,6 @@ class MenuServiceTest {
     void mounted_docUndefined_filtered() {
         when(cacheService.get(CacheKeyBuilder.menuTree())).thenReturn(null);
         when(cacheService.tryRebuildLock(anyString())).thenReturn("lock-token");
-        when(cacheService.putIfNotEvicted(anyString(), anyString(), anyLong())).thenReturn(true);
         when(menuConfigRepository.getSchemaVersion()).thenReturn(5L);
         when(menuConfigRepository.findAll()).thenReturn(List.of(
                 entry("doc", "ghost_doc", "biz_doc", 1L, true)));
@@ -277,7 +273,10 @@ class MenuServiceTest {
         MenuMountedView view = service.mounted();
         assertThat(view.getItems()).isEmpty();
         org.mockito.Mockito.verify(cacheService, org.mockito.Mockito.never())
-                .putIfNotEvicted(anyString(), anyString(), anyLong());
+                .finishRebuild(org.mockito.ArgumentMatchers.anyString(),
+                        org.mockito.ArgumentMatchers.anyString(),
+                        org.mockito.ArgumentMatchers.any(),
+                        org.mockito.ArgumentMatchers.anyBoolean());
     }
 
     @Test
@@ -285,7 +284,7 @@ class MenuServiceTest {
     void warmup() {
         when(menuConfigRepository.findAll()).thenReturn(List.of());
         service.warmup();
-        verify(cacheService).put(anyString(), anyString());
+        verify(cacheService).putShared(anyString(), anyString());
     }
 
     @Test

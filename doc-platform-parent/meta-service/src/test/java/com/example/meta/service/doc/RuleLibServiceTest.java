@@ -152,7 +152,7 @@ class RuleLibServiceTest {
         assertThat(updated.getVersion()).isEqualTo(1L);
         assertThat(updated.isEnabled()).isFalse();
         verify(ruleLibRepository).updateWithVersion(updated);
-        verify(cacheService).evict(CacheKeyBuilder.rule("r1"));
+        verify(cacheService).invalidateShared(CacheKeyBuilder.rule("r1"));
         verify(publisher).publish(any(SchemaInvalidationEvent.class));
 
         when(ruleLibRepository.findByUuid("none")).thenReturn(Optional.empty());
@@ -193,7 +193,7 @@ class RuleLibServiceTest {
         when(docRuleConfigRepository.findAll()).thenReturn(List.of());
         service.delete("r1");
         verify(ruleLibRepository).deleteByUuidIfVersion("r1", 0L);
-        verify(cacheService).evict(CacheKeyBuilder.rule("r1"));
+        verify(cacheService).invalidateShared(CacheKeyBuilder.rule("r1"));
 
         when(ruleLibRepository.findByUuid("raced")).thenReturn(Optional.of(entry("raced", 2)));
         doThrow(new TsConditionCheckException("condition check fail"))
@@ -271,13 +271,13 @@ class RuleLibServiceTest {
         when(cacheService.tryRebuildLock(anyString())).thenReturn("token");
         when(ruleLibRepository.findByUuid("r2")).thenReturn(Optional.of(entry("r2", 0)));
         assertThat(service.getPublishedDto("r2").getUuid()).isEqualTo("r2");
-        verify(cacheService).putIfNotEvicted(anyString(), anyString(), anyLong());
+        verify(cacheService).finishRebuild(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyBoolean());
 
         when(cacheService.get(CacheKeyBuilder.rule("gone"))).thenReturn(null);
         when(ruleLibRepository.findByUuid("gone")).thenReturn(Optional.empty());
         assertThatThrownBy(() -> service.getPublishedDto("gone"))
                 .isInstanceOf(BizException.class)
                 .extracting(e -> ((BizException) e).getCode()).isEqualTo(40401);
-        verify(cacheService).putNull(CacheKeyBuilder.rule("gone"));
+        verify(cacheService).finishRebuildNull(org.mockito.ArgumentMatchers.eq(CacheKeyBuilder.rule("gone")), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.eq(true));
     }
 }

@@ -2,6 +2,7 @@ package com.example.common.infrastructure.cache;
 
 import java.time.Duration;
 import java.util.Collections;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -58,12 +59,35 @@ public class CacheService {
             "if redis.call('GET', KEYS[1]) == ARGV[1] then "
                     + "return redis.call('DEL', KEYS[1]) else return 0 end", Long.class);
 
+    /**
+     * 版本栅栏写入：仅当当前栅栏版本不大于回源起始快照版本时写入，原子拒绝陈旧回填。
+     * KEYS[1]=值键，KEYS[2]=栅栏键；ARGV[1]=值，ARGV[2]=快照版本，ARGV[3]=TTL 毫秒。
+     */
+    private static final RedisScript<Long> FENCED_SET_SCRIPT = new DefaultRedisScript<>(
+            "local fence = redis.call('GET', KEYS[2]); "
+                    + "if fence and tonumber(fence) > tonumber(ARGV[2]) then return 0 end; "
+                    + "redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[3]); return 1", Long.class);
+
+    /**
+     * 失效并推进栅栏：INCR 栅栏键 + DEL 值键（单脚本原子；Redis 非集群模式）。
+     * KEYS[1]=栅栏键，KEYS[2]=值键。
+     */
+    private static final RedisScript<Long> FENCE_EVICT_SCRIPT = new DefaultRedisScript<>(
+            "local version = redis.call('INCR', KEYS[1]); "
+                    + "redis.call('DEL', KEYS[2]); return version", Long.class);
+
     private final CacheProperties properties;
     private final StringRedisTemplate redisTemplate;
     private final Cache<String, String> localCache;
 
     /** 失效时间戳（nanoTime）：重建回填前比对，防止回源期间被失效的 key 回填旧值 */
     private final ConcurrentMap<String, Long> evictStamps = new ConcurrentHashMap<>();
+
+    /** 本地栅栏版本（runtime 仅本地缓存；schema 键失效单调递增） */
+    private final ConcurrentMap<String, Long> localFences = new ConcurrentHashMap<>();
+
+    /** 本地每键互斥：本地栅栏检查与回填必须原子（schema 键数量有限） */
+    private final ConcurrentMap<String, Object> localLocks = new ConcurrentHashMap<>();
 
     /** L1/L2 命中计数（bindMetrics 后生效；未绑定为 null 不打点，design/11 §4.2 缓存命中率） */
     private Counter l2HitCounter;
@@ -93,10 +117,21 @@ public class CacheService {
             return local;
         }
         increment(l2MissCounter);
+        // 本地栅栏/失效时间戳快照：Redis 读取期间若发生失效，不得把旧值重新装回本地
+        long fenceBeforeRead = localFences.getOrDefault(key, 0L);
+        long readStartedAt = System.nanoTime();
         String remote = redisGet(key);
         if (remote != null) {
             increment(l1HitCounter);
-            localCache.put(key, remote);
+            Object lock = localLocks.computeIfAbsent(key, ignored -> new Object());
+            synchronized (lock) {
+                Long evictedAt = evictStamps.get(key);
+                boolean invalidatedDuringRead = evictedAt != null && evictedAt > readStartedAt;
+                boolean fenceAdvanced = localFences.getOrDefault(key, 0L) > fenceBeforeRead;
+                if (!invalidatedDuringRead && !fenceAdvanced) {
+                    localCache.put(key, remote);
+                }
+            }
         } else {
             increment(l1MissCounter);
         }
@@ -207,14 +242,148 @@ public class CacheService {
     }
 
     /**
-     * 重建回填（评审修复 Minor-10）：写 Redis 前比对 key 是否在重建开始后已被
-     * {@link #evict} 失效；已失效则放弃回填（防止旧值覆盖新值），否则正常两级写入。
+     * 回源起始快照：shared=true 读取 Redis 栅栏版本（meta 权威写方），
+     * false 读取本地栅栏版本（runtime 仅本地缓存）。
      *
-     * @param key               缓存键
-     * @param value             JSON 值
-     * @param rebuildStartStamp 重建开始时间戳（{@link System#nanoTime()}）
-     * @return true=已回填；false=重建期间被失效，放弃回填
+     * @param key    缓存键
+     * @param shared 是否共享 Redis
+     * @return 快照（版本 + 开始时间）
      */
+    public CacheStamp beginRebuild(String key, boolean shared) {
+        long version = shared ? redisFenceVersion(key) : localFences.getOrDefault(key, 0L);
+        return new CacheStamp(version, System.nanoTime());
+    }
+
+    /**
+     * 栅栏保护回填：本地失效戳/栅栏版本校验 + shared 模式的 Redis 原子条件写。
+     * shared=true 时仅 meta-service 调用（Redis 共享写方）；runtime 用 false 只写本地。
+     *
+     * @param key    缓存键
+     * @param value  缓存值
+     * @param stamp  {@link #beginRebuild} 快照
+     * @param shared 是否写 Redis
+     * @return true=已回填；false=回源期间已失效，放弃旧值
+     */
+    public boolean finishRebuild(String key, String value, CacheStamp stamp, boolean shared) {
+        return finishRebuildInternal(key, value, stamp, shared,
+                jitterSeconds(properties.getL1TtlMinutes() * 60));
+    }
+
+    /**
+     * 空值占位回填（短 TTL），同样受栅栏保护。
+     *
+     * @param key    缓存键
+     * @param stamp  {@link #beginRebuild} 快照
+     * @param shared 是否写 Redis
+     * @return true=已回填
+     */
+    public boolean finishRebuildNull(String key, CacheStamp stamp, boolean shared) {
+        return finishRebuildInternal(key, NULL_PLACEHOLDER, stamp, shared,
+                properties.getNullTtlSeconds());
+    }
+
+    private boolean finishRebuildInternal(String key, String value, CacheStamp stamp,
+                                          boolean shared, long ttlSeconds) {
+        if (stamp == null) {
+            // 兼容测试桩/旧调用：无快照时退化为普通写入（生产调用恒非空）
+            if (NULL_PLACEHOLDER.equals(value)) {
+                putNull(key);
+            } else {
+                put(key, value);
+            }
+            return true;
+        }
+        Object lock = localLocks.computeIfAbsent(key, ignored -> new Object());
+        synchronized (lock) {
+            Long evictedAt = evictStamps.get(key);
+            if (evictedAt != null && evictedAt > stamp.startedAtNanos()) {
+                log.warn("[cache] 重建期间 key 已被失效，放弃回填旧值: key={}", key);
+                return false;
+            }
+            if (localFences.getOrDefault(key, 0L) > stamp.version()) {
+                log.warn("[cache] 本地栅栏已推进，放弃回填旧值: key={}, stamp={}, fence={}",
+                        key, stamp.version(), localFences.get(key));
+                return false;
+            }
+            if (shared && !fencedRedisSet(key, value, stamp.version(), ttlSeconds)) {
+                return false;
+            }
+            localCache.put(key, value);
+            return true;
+        }
+    }
+
+    /**
+     * 共享缓存失效（meta 发布/停用/删除）：推进 Redis 栅栏并删除值，本地同步失效。
+     * 旧版本回源即使稍后完成，也会被 Redis 栅栏拒绝。
+     *
+     * @param key 缓存键
+     */
+    public void invalidateShared(String key) {
+        Object lock = localLocks.computeIfAbsent(key, ignored -> new Object());
+        synchronized (lock) {
+            evictStamps.put(key, System.nanoTime());
+            localCache.invalidate(key);
+            try {
+                Long newVersion = redisTemplate.execute(FENCE_EVICT_SCRIPT,
+                        List.of(fenceKey(key), key));
+                if (newVersion != null) {
+                    localFences.merge(key, newVersion, Math::max);
+                }
+            } catch (RuntimeException e) {
+                // Redis 不可达：本地栅栏自增，保证本实例不回填旧值；Redis 值依赖 TTL/重试
+                localFences.merge(key, 1L, Long::sum);
+                try {
+                    redisTemplate.delete(key);
+                } catch (RuntimeException ignored) {
+                    log.warn("[cache] 共享栅栏推进失败，依赖 TTL 兜底: key={}, cause={}",
+                            key, e.getMessage());
+                }
+            }
+        }
+    }
+
+    /**
+     * 仅本地失效（runtime 消费广播）：推进本地栅栏，阻止在途回源写回旧值。
+     *
+     * @param key     缓存键
+     * @param version 广播版本（&lt;1 时按自增处理）
+     */
+    public void invalidateLocal(String key, long version) {
+        Object lock = localLocks.computeIfAbsent(key, ignored -> new Object());
+        synchronized (lock) {
+            evictStamps.put(key, System.nanoTime());
+            localCache.invalidate(key);
+            localFences.merge(key, Math.max(1L, version), Math::max);
+        }
+    }
+
+    /** 仅本地失效（不推进栅栏；meta 消费自身广播时使用，共享栅栏由发布方推进） */
+    public void evictLocalOnly(String key) {
+        Object lock = localLocks.computeIfAbsent(key, ignored -> new Object());
+        synchronized (lock) {
+            evictStamps.put(key, System.nanoTime());
+            localCache.invalidate(key);
+        }
+    }
+
+    /** runtime 预热/本地权威写入（不写 Redis） */
+    public void putLocal(String key, String value) {
+        localCache.put(key, value);
+    }
+
+    /** meta 权威预热写入：以写入瞬间栅栏为快照，若期间发生发布则放弃本次回填 */
+    public void putShared(String key, String value) {
+        finishRebuild(key, value, beginRebuild(key, true), true);
+    }
+
+    /**
+     * 旧版回填接口（保留兼容非 schema 缓存/历史调用）。
+     *
+     * @deprecated schema 缓存请使用 {@link #beginRebuild}/{@link #finishRebuild}，
+     *             本方法只做本地失效戳比对，不提供跨实例原子栅栏。
+     */
+    @Deprecated
     public boolean putIfNotEvicted(String key, String value, long rebuildStartStamp) {
         Long evictedAt = evictStamps.get(key);
         if (evictedAt != null && evictedAt > rebuildStartStamp) {
@@ -223,6 +392,40 @@ public class CacheService {
         }
         put(key, value);
         return true;
+    }
+
+    /** 共享栅栏读取（Redis 不可达返回 0，退化为本地/直读） */
+    private long redisFenceVersion(String key) {
+        try {
+            String raw = redisTemplate.opsForValue().get(fenceKey(key));
+            return raw == null || raw.isBlank() ? 0L : Long.parseLong(raw.trim());
+        } catch (RuntimeException e) {
+            log.warn("[cache] 读取共享栅栏失败，按 0 处理: key={}, cause={}", key, e.getMessage());
+            return 0L;
+        }
+    }
+
+    /** Redis 原子条件写；异常时降级为仅本地（不写共享缓存） */
+    private boolean fencedRedisSet(String key, String value, long stampVersion, long ttlSeconds) {
+        try {
+            Long result = redisTemplate.execute(FENCED_SET_SCRIPT,
+                    List.of(key, fenceKey(key)), value,
+                    Long.toString(stampVersion),
+                    Long.toString(Math.max(1L, ttlSeconds) * 1000L));
+            return Long.valueOf(1L).equals(result);
+        } catch (RuntimeException e) {
+            log.warn("[cache] 共享栅栏写入失败，仅保留本地缓存: key={}, cause={}",
+                    key, e.getMessage());
+            return true;
+        }
+    }
+
+    private static String fenceKey(String key) {
+        return key + ":fence";
+    }
+
+    /** 回源起始快照（版本 + nanoTime） */
+    public record CacheStamp(long version, long startedAtNanos) {
     }
 
     /**

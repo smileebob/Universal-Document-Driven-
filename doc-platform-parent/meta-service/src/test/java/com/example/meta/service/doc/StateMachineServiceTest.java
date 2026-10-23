@@ -108,7 +108,7 @@ class StateMachineServiceTest {
         assertThat(result.get("version")).isEqualTo(1L);
         assertThat((List<?>) result.get("warnings")).isEmpty();
         verify(stateMachineRepository).insert(any(StateMachineConfig.class));
-        verify(cacheService).evict(CacheKeyBuilder.stateMachine("po"));
+        verify(cacheService).invalidateShared(CacheKeyBuilder.stateMachine("po"));
         verify(publisher).publish(any(SchemaInvalidationEvent.class));
         verify(configAuditService).recordConfig(eq("state_machine"), eq("po"), eq("save"), any(), any());
     }
@@ -272,7 +272,7 @@ class StateMachineServiceTest {
         when(cacheService.tryRebuildLock(anyString())).thenReturn("token");
         when(stateMachineRepository.findByDocCode("po2")).thenReturn(Optional.of(config));
         assertThat(service.getPublishedDto("po2").getDocCode()).isEqualTo("po");
-        verify(cacheService).putIfNotEvicted(anyString(), anyString(), anyLong());
+        verify(cacheService).finishRebuild(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyBoolean());
         verify(cacheService).releaseRebuildLock(anyString(), anyString());
 
         when(cacheService.get(CacheKeyBuilder.stateMachine("ghost"))).thenReturn(null);
@@ -280,6 +280,6 @@ class StateMachineServiceTest {
         assertThatThrownBy(() -> service.getPublishedDto("ghost"))
                 .isInstanceOf(BizException.class)
                 .extracting(e -> ((BizException) e).getCode()).isEqualTo(40401);
-        verify(cacheService).putNull(CacheKeyBuilder.stateMachine("ghost"));
+        verify(cacheService).finishRebuildNull(org.mockito.ArgumentMatchers.eq(CacheKeyBuilder.stateMachine("ghost")), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.eq(true));
     }
 }

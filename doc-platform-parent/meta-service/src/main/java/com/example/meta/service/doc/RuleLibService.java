@@ -230,13 +230,13 @@ public class RuleLibService {
         boolean locked = lockToken != null;
         try {
             if (locked) {
-                long rebuildStart = System.nanoTime();
+                CacheService.CacheStamp stamp = cacheService.beginRebuild(key, true);
                 RuleLibDTO dto = load(uuid);
                 if (dto == null) {
-                    cacheService.putNull(key);
+                    cacheService.finishRebuildNull(key, stamp, true);
                     throw notFound(uuid);
                 }
-                cacheService.putIfNotEvicted(key, toJson(dto), rebuildStart);
+                cacheService.finishRebuild(key, toJson(dto), stamp, true);
                 return dto;
             }
             for (int i = 0; i < cacheService.rebuildMaxWaits(); i++) {
@@ -329,7 +329,7 @@ public class RuleLibService {
     }
 
     private void invalidateRule(String uuid, long version) {
-        cacheService.evict(CacheKeyBuilder.rule(uuid));
+        cacheService.invalidateShared(CacheKeyBuilder.rule(uuid));
         invalidationPublisher.publish(SchemaInvalidationEvent.configChanged(
                 CacheDomains.RULE_LIB, uuid, version));
         bumpGlobalVersion();

@@ -119,7 +119,7 @@ public class MenuService {
         menuConfigRepository.save(entry);
 
         long newVersion = bumpGlobalVersion();
-        cacheService.evict(CacheKeyBuilder.menuTree());
+        cacheService.invalidateShared(CacheKeyBuilder.menuTree());
         invalidationPublisher.publish(SchemaInvalidationEvent.configChanged(
                 CacheDomains.MENU_CONFIG, entry.targetKey(), newVersion));
         log.info("[menu-config] 挂载配置保存: targetKey={}, enabled={}, version={}",
@@ -172,10 +172,10 @@ public class MenuService {
         boolean locked = lockToken != null;
         try {
             if (locked) {
-                long rebuildStart = System.nanoTime();
+                CacheService.CacheStamp stamp = cacheService.beginRebuild(key, true);
                 MenuMountedView view = buildMountedView();
                 // 回填前比对失效时间戳（评审修复 Minor-10），防旧值覆盖新值
-                cacheService.putIfNotEvicted(key, toJson(view), rebuildStart);
+                cacheService.finishRebuild(key, toJson(view), stamp, true);
                 return view;
             }
             // 未获锁：50ms 轮询重读，超限直读不回填
@@ -197,7 +197,7 @@ public class MenuService {
     /** 启动预热：已挂载视图写入两级缓存（容错由 CacheWarmupRunner 承担） */
     public void warmup() {
         MenuMountedView view = buildMountedView();
-        cacheService.put(CacheKeyBuilder.menuTree(), toJson(view));
+        cacheService.putShared(CacheKeyBuilder.menuTree(), toJson(view));
         log.info("[menu-config] 预热完成: items={}, schemaVersion={}",
                 view.getItems().size(), view.getSchemaVersion());
     }

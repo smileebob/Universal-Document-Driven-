@@ -110,7 +110,7 @@ public class DocRuleConfigService {
         config.setVersion(config.getVersion() + 1);
 
         // 保存即时失效：DEL Redis → 广播 CONFIG_CHANGED
-        cacheService.evict(CacheKeyBuilder.docRuleConfig(docCode));
+        cacheService.invalidateShared(CacheKeyBuilder.docRuleConfig(docCode));
         invalidationPublisher.publish(SchemaInvalidationEvent.configChanged(
                 CacheDomains.DOC_RULE_CONFIG, docCode, config.getVersion()));
         bumpGlobalVersion();
@@ -144,13 +144,13 @@ public class DocRuleConfigService {
         boolean locked = lockToken != null;
         try {
             if (locked) {
-                long rebuildStart = System.nanoTime();
+                CacheService.CacheStamp stamp = cacheService.beginRebuild(key, true);
                 DocRuleConfigDTO dto = load(docCode);
                 if (dto == null) {
-                    cacheService.putNull(key);
+                    cacheService.finishRebuildNull(key, stamp, true);
                     throw notConfigured(docCode);
                 }
-                cacheService.putIfNotEvicted(key, toJson(dto), rebuildStart);
+                cacheService.finishRebuild(key, toJson(dto), stamp, true);
                 return dto;
             }
             for (int i = 0; i < cacheService.rebuildMaxWaits(); i++) {

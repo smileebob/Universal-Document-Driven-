@@ -218,7 +218,7 @@ public class SchemaService {
                 entry.setEnabled(false);
                 entry.setUpdateTime(System.currentTimeMillis());
                 menuConfigRepository.save(entry);
-                cacheService.evict(CacheKeyBuilder.menuTree());
+                cacheService.invalidateShared(CacheKeyBuilder.menuTree());
             }
         });
 
@@ -301,14 +301,14 @@ public class SchemaService {
         boolean locked = lockToken != null;
         try {
             if (locked) {
-                long rebuildStart = System.nanoTime();
+                CacheService.CacheStamp stamp = cacheService.beginRebuild(key, true);
                 EntitySchemaDTO dto = loadPublished(code);
                 if (dto == null) {
-                    cacheService.putNull(key);
+                    cacheService.finishRebuildNull(key, stamp, true);
                     throw notFound(code);
                 }
                 // 回填前比对失效时间戳（评审修复 Minor-10），防旧值覆盖新值
-                cacheService.putIfNotEvicted(key, toJson(dto), rebuildStart);
+                cacheService.finishRebuild(key, toJson(dto), stamp, true);
                 return dto;
             }
             // 未获锁：等待 50ms 轮询重读，命中即返回；超限直读回源不回填
@@ -343,7 +343,7 @@ public class SchemaService {
     public void warmup() {
         List<EntitySchemaDTO> published = listPublishedDtos();
         for (EntitySchemaDTO dto : published) {
-            cacheService.put(CacheKeyBuilder.entitySchema(dto.getCode()), toJson(dto));
+            cacheService.putShared(CacheKeyBuilder.entitySchema(dto.getCode()), toJson(dto));
         }
         log.info("[entity-schema] 预热完成: count={}", published.size());
     }
@@ -410,7 +410,7 @@ public class SchemaService {
     }
 
     private void invalidateCache(String code) {
-        cacheService.evict(CacheKeyBuilder.entitySchema(code));
+        cacheService.invalidateShared(CacheKeyBuilder.entitySchema(code));
     }
 
     private void bumpGlobalVersion() {

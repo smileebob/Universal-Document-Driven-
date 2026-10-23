@@ -95,7 +95,7 @@ public class TxConfigService {
         txConfigRepository.save(config);
 
         // 保存即时失效：DEL 缓存键 → 广播 CONFIG_CHANGED（tx_config 域）
-        cacheService.evict(CacheKeyBuilder.txConfig(docCode));
+        cacheService.invalidateShared(CacheKeyBuilder.txConfig(docCode));
         invalidationPublisher.publish(SchemaInvalidationEvent.configChanged(
                 CacheDomains.TX_CONFIG, docCode, now));
         bumpGlobalVersion();

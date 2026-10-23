@@ -155,6 +155,19 @@ class CacheServiceTest {
     }
 
     @Test
+    @DisplayName("本地栅栏：失效后旧回源快照不得回填，新快照可回填")
+    void localFence_rejectsStaleRebuild() {
+        CacheService.CacheStamp stale = cacheService.beginRebuild("k-local", false);
+        cacheService.invalidateLocal("k-local", 1L);
+        assertThat(cacheService.finishRebuild("k-local", "old", stale, false)).isFalse();
+        assertThat(cacheService.getLocalIfPresent("k-local")).isNull();
+
+        CacheService.CacheStamp fresh = cacheService.beginRebuild("k-local", false);
+        assertThat(cacheService.finishRebuild("k-local", "new", fresh, false)).isTrue();
+        assertThat(cacheService.getLocalIfPresent("k-local")).isEqualTo("new");
+    }
+
+    @Test
     @DisplayName("等待参数与属性默认值")
     void waitParams() {
         assertThat(cacheService.rebuildWaitMillis()).isEqualTo(50L);

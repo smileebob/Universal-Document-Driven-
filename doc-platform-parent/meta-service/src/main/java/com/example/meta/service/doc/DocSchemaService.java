@@ -295,14 +295,14 @@ public class DocSchemaService {
         boolean locked = lockToken != null;
         try {
             if (locked) {
-                long rebuildStart = System.nanoTime();
+                CacheService.CacheStamp stamp = cacheService.beginRebuild(key, true);
                 DocSchemaDTO dto = loadPublished(code);
                 if (dto == null) {
-                    cacheService.putNull(key);
+                    cacheService.finishRebuildNull(key, stamp, true);
                     throw notFound(code);
                 }
                 // 回填前比对失效时间戳，防旧值覆盖新值
-                cacheService.putIfNotEvicted(key, toJson(dto), rebuildStart);
+                cacheService.finishRebuild(key, toJson(dto), stamp, true);
                 return dto;
             }
             // 未获锁：等待轮询重读，命中即返回；超限直读回源不回填
@@ -337,7 +337,7 @@ public class DocSchemaService {
     public void warmup() {
         List<DocSchemaDTO> published = listPublishedDtos();
         for (DocSchemaDTO dto : published) {
-            cacheService.put(CacheKeyBuilder.docSchema(dto.getCode()), toJson(dto));
+            cacheService.putShared(CacheKeyBuilder.docSchema(dto.getCode()), toJson(dto));
         }
         log.info("[doc-schema] 预热完成: count={}", published.size());
     }
@@ -405,7 +405,7 @@ public class DocSchemaService {
     }
 
     private void invalidateCache(String code) {
-        cacheService.evict(CacheKeyBuilder.docSchema(code));
+        cacheService.invalidateShared(CacheKeyBuilder.docSchema(code));
     }
 
     private void bumpGlobalVersion() {

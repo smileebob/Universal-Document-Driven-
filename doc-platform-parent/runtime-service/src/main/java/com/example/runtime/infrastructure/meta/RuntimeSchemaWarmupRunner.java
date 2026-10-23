@@ -60,7 +60,7 @@ public class RuntimeSchemaWarmupRunner implements ApplicationRunner {
                 if (dto.getCode() == null) {
                     continue;
                 }
-                cacheService.put(CacheKeyBuilder.entitySchema(dto.getCode()), toJson(dto));
+                cacheService.putLocal(CacheKeyBuilder.entitySchema(dto.getCode()), toJson(dto));
                 count++;
             }
             log.info("[warmup] 实体定义预热完成: count={}", count);
@@ -83,7 +83,7 @@ public class RuntimeSchemaWarmupRunner implements ApplicationRunner {
                 if (dto.getCode() == null) {
                     continue;
                 }
-                cacheService.put(CacheKeyBuilder.docSchema(dto.getCode()), toJson(dto));
+                cacheService.putLocal(CacheKeyBuilder.docSchema(dto.getCode()), toJson(dto));
                 count++;
             }
             log.info("[warmup] 单据定义预热完成: count={}", count);

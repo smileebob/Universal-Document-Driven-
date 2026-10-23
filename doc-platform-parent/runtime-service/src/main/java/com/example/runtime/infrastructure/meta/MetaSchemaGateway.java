@@ -222,13 +222,13 @@ public class MetaSchemaGateway implements SchemaGateway, DocConfigGateway {
         boolean locked = lockToken != null;
         try {
             if (locked) {
-                long rebuildStart = System.nanoTime();
+                CacheService.CacheStamp stamp = cacheService.beginRebuild(cacheKey, false);
                 T dto = fetchRemote(cacheKey, fetch);
                 if (dto == null) {
-                    cacheService.putNull(cacheKey);
+                    cacheService.finishRebuildNull(cacheKey, stamp, false);
                     return null;
                 }
-                cacheService.putIfNotEvicted(cacheKey, toJson(dto), rebuildStart);
+                cacheService.finishRebuild(cacheKey, toJson(dto), stamp, false);
                 return dto;
             }
             // 未获锁：等待轮询重读，命中即返回；超限直读回源不回填

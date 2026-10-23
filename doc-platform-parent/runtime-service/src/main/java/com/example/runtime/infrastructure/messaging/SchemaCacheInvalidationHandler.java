@@ -77,7 +77,7 @@ public class SchemaCacheInvalidationHandler {
                 log.debug("[runtime-schema-invalidation] 非本服务缓存域，忽略: domain={}", domain);
                 return;
             }
-            cacheService.evict(cacheKey);
+            cacheService.invalidateLocal(cacheKey, version);
             log.info("[runtime-schema-invalidation] 缓存失效完成: domain={}, code={}, version={}",
                     domain, code, version);
         } catch (IOException | RuntimeException e) {

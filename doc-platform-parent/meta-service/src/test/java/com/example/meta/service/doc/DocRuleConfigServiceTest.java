@@ -90,7 +90,7 @@ class DocRuleConfigServiceTest {
         assertThat(result.get("doc_code")).isEqualTo("po");
         assertThat(result.get("version")).isEqualTo(1L);
         verify(docRuleConfigRepository).insert(any(DocRuleConfig.class));
-        verify(cacheService).evict(CacheKeyBuilder.docRuleConfig("po"));
+        verify(cacheService).invalidateShared(CacheKeyBuilder.docRuleConfig("po"));
         verify(publisher).publish(any(SchemaInvalidationEvent.class));
         verify(configAuditService).recordConfig(eq("doc_rule_config"), eq("po"), eq("save"), any(), any());
     }
@@ -203,13 +203,13 @@ class DocRuleConfigServiceTest {
         when(cacheService.tryRebuildLock(anyString())).thenReturn("token");
         when(docRuleConfigRepository.findByDocCode("po2")).thenReturn(Optional.of(config));
         assertThat(service.getPublishedDto("po2").getDocCode()).isEqualTo("po");
-        verify(cacheService).putIfNotEvicted(anyString(), anyString(), anyLong());
+        verify(cacheService).finishRebuild(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyBoolean());
 
         when(cacheService.get(CacheKeyBuilder.docRuleConfig("ghost"))).thenReturn(null);
         when(docRuleConfigRepository.findByDocCode("ghost")).thenReturn(Optional.empty());
         assertThatThrownBy(() -> service.getPublishedDto("ghost"))
                 .isInstanceOf(BizException.class)
                 .extracting(e -> ((BizException) e).getCode()).isEqualTo(40401);
-        verify(cacheService).putNull(CacheKeyBuilder.docRuleConfig("ghost"));
+        verify(cacheService).finishRebuildNull(org.mockito.ArgumentMatchers.eq(CacheKeyBuilder.docRuleConfig("ghost")), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.eq(true));
     }
 }
