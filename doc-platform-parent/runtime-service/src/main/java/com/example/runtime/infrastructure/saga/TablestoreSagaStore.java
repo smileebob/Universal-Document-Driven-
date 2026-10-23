@@ -53,6 +53,7 @@ public class TablestoreSagaStore implements SagaStore {
         columns.put("doc_uuid", TsColumnValue.of(execution.getDocUuid()));
         columns.put("from_status", TsColumnValue.of(execution.getFromStatus()));
         columns.put("to_status", TsColumnValue.of(execution.getToStatus()));
+        columns.put("expected_version", TsColumnValue.of(execution.getExpectedVersion()));
         columns.put("status", TsColumnValue.of(execution.getStatus().getCode()));
         columns.put("current_step_seq", TsColumnValue.of(execution.getCurrentStepSeq()));
         if (execution.getStepLogs() != null) {
@@ -99,15 +100,25 @@ public class TablestoreSagaStore implements SagaStore {
 
     @Override
     public List<SagaExecution> scanStuckExecuting(long updateTimeBefore) {
-        List<SagaExecution> stuck = new ArrayList<>();
+        return scanByStatus(SagaStatus.EXECUTING, updateTimeBefore);
+    }
+
+    @Override
+    public List<SagaExecution> scanActionsSucceeded(long updateTimeBefore) {
+        return scanByStatus(SagaStatus.ACTIONS_SUCCEEDED, updateTimeBefore);
+    }
+
+    /** 全表扫描 + 状态/更新时间过滤（V1 无索引，行数百级） */
+    private List<SagaExecution> scanByStatus(SagaStatus expected, long updateTimeBefore) {
+        List<SagaExecution> result = new ArrayList<>();
         for (TsRow row : template.getRange(TABLE_EXECUTION)) {
             SagaExecution execution = mapExecution(row);
-            if (execution.getStatus() == SagaStatus.EXECUTING
+            if (execution.getStatus() == expected
                     && execution.getUpdateTime() <= updateTimeBefore) {
-                stuck.add(execution);
+                result.add(execution);
             }
         }
-        return stuck;
+        return result;
     }
 
     // ==================== saga_dead_letter ====================
@@ -187,6 +198,7 @@ public class TablestoreSagaStore implements SagaStore {
         execution.setDocUuid(row.getString("doc_uuid"));
         execution.setFromStatus(longOf(row, "from_status"));
         execution.setToStatus(longOf(row, "to_status"));
+        execution.setExpectedVersion(longOf(row, "expected_version"));
         SagaStatus status = SagaStatus.fromCode(row.getString("status"));
         execution.setStatus(status == null ? SagaStatus.EXECUTING : status);
         execution.setCurrentStepSeq(longOf(row, "current_step_seq"));

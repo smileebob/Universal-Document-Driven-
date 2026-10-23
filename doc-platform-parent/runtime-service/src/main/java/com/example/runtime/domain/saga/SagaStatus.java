@@ -9,10 +9,13 @@ package com.example.runtime.domain.saga;
  */
 public enum SagaStatus {
 
-    /** 正向执行中（含事务提交前窗口） */
+    /** 正向执行中 */
     EXECUTING("EXECUTING"),
 
-    /** 全部步骤成功且局部事务已提交 */
+    /** 外部步骤全部成功，本地单据提交待收口（崩溃恢复据此决定提交或冲正） */
+    ACTIONS_SUCCEEDED("ACTIONS_SUCCEEDED"),
+
+    /** 外部步骤成功且本地单据已提交 */
     COMPLETED("COMPLETED"),
 
     /** 正向失败，逆序冲正中 */

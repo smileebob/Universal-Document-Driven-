@@ -178,15 +178,25 @@ public class TransitionService {
                 sagaId = SagaOrchestrator.deriveSagaId(idempotencyKey, uuid, targetStatus);
                 try {
                     SagaOrchestrator.SagaResult sagaResult = sagaOrchestrator.execute(
-                            sagaId, plan, docCode, uuid, currentStatus, targetStatus, operator);
-                    // 幂等重放可能回放 COMPENSATED/DEAD：不得继续提交单据
-                    if (sagaResult != null && sagaResult.status() != SagaStatus.COMPLETED) {
+                            sagaId, plan, docCode, uuid, record.getVersion(),
+                            currentStatus, targetStatus, operator);
+                    SagaStatus sagaStatus = sagaResult == null ? null : sagaResult.status();
+                    if (sagaStatus == SagaStatus.COMPLETED) {
+                        // 幂等重放已完成后再次进入：不得重复提交本地事务
                         Map<String, Object> data = new LinkedHashMap<>();
                         data.put("saga_id", sagaId);
-                        data.put("saga_status", sagaResult.status() == null
-                                ? "UNKNOWN" : sagaResult.status().getCode());
+                        data.put("saga_status", "COMPLETED");
                         throw new BizException(ErrorCode.TX_FAILED,
-                                "事务步骤此前未成功完成（" + data.get("saga_status")
+                                "事务步骤已完成，请刷新后查看单据状态", data);
+                    }
+                    // 正常路径为 ACTIONS_SUCCEEDED；null 兼容测试桩。
+                    // COMPENSATED/DEAD 等终态不得提交单据。
+                    if (sagaStatus != null && sagaStatus != SagaStatus.ACTIONS_SUCCEEDED) {
+                        Map<String, Object> data = new LinkedHashMap<>();
+                        data.put("saga_id", sagaId);
+                        data.put("saga_status", sagaStatus.getCode());
+                        throw new BizException(ErrorCode.TX_FAILED,
+                                "事务步骤此前未成功完成（" + sagaStatus.getCode()
                                         + "），不可提交单据", data);
                     }
                     sagaTriggered = true;
@@ -226,6 +236,16 @@ public class TransitionService {
                 String suffix = compensateAfterCommitFailure(sagaId);
                 throw new BizException(ErrorCode.STATUS_CONFLICT,
                         "存储层并发冲突" + suffix + "，请重试", e);
+            }
+
+            // ⑤.4 Saga 收口：本地提交成功后才把 ACTIONS_SUCCEEDED 标为 COMPLETED。
+            // 标记失败不阻断主流程，恢复任务会依据单据已到目标状态补收口。
+            if (sagaId != null) {
+                try {
+                    sagaOrchestrator.markCommitted(sagaId);
+                } catch (RuntimeException e) {
+                    log.warn("[transition] Saga 完成标记失败，转恢复任务收口: sagaId={}", sagaId, e);
+                }
             }
 
             // ⑤.5 outbox 即时首发（事务外）：内存队列异步入队，失败由 5s 扫描兜底

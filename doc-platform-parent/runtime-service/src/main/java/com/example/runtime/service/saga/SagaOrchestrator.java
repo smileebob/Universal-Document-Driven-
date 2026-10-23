@@ -146,18 +146,20 @@ public class SagaOrchestrator {
      * @param plan           事务计划（tx_config 按流转匹配）
      * @param docCode        单据编码
      * @param uuid           单据实例
+     * @param expectedVersion 规则/Saga 执行前读取的单据版本（恢复提交快照）
      * @param fromStatus     起始状态
      * @param toStatus       目标状态
      * @param operator       操作人
      * @param idempotencyKey 流转幂等键（X-Idempotency-Key，可空→退化 uuid+toStatus）
-     * @return 编排结果（COMPLETED 才可继续提交流转事务）
+     * @return 编排结果（ACTIONS_SUCCEEDED 才可继续提交流转事务）
      * @throws SagaCompensatedException 正向失败且冲正完成
      * @throws SagaDeadException        冲正失败（已落死信）
      */
-    public SagaResult execute(TxPlan plan, String docCode, String uuid, long fromStatus,
-                              long toStatus, String operator, String idempotencyKey) {
+    public SagaResult execute(TxPlan plan, String docCode, String uuid, long expectedVersion,
+                              long fromStatus, long toStatus, String operator,
+                              String idempotencyKey) {
         return execute(deriveSagaId(idempotencyKey, uuid, toStatus), plan, docCode, uuid,
-                fromStatus, toStatus, operator);
+                expectedVersion, fromStatus, toStatus, operator);
     }
 
     /**
@@ -165,9 +167,11 @@ public class SagaOrchestrator {
      * (avoids random-tail divergence caused by double derivation without idempotency key).
      *
      * @param sagaId pre-derived saga instance id
+     * @param expectedVersion 规则/Saga 执行前读取的单据版本
      */
     public SagaResult execute(String sagaId, TxPlan plan, String docCode, String uuid,
-                              long fromStatus, long toStatus, String operator) {
+                              long expectedVersion, long fromStatus, long toStatus,
+                              String operator) {
         long now = System.currentTimeMillis();
 
         SagaExecution execution = new SagaExecution();
@@ -176,6 +180,7 @@ public class SagaOrchestrator {
         execution.setDocUuid(uuid);
         execution.setFromStatus(fromStatus);
         execution.setToStatus(toStatus);
+        execution.setExpectedVersion(expectedVersion);
         execution.setStatus(SagaStatus.EXECUTING);
         execution.setCurrentStepSeq(0L);
         execution.setStepLogs("[]");
@@ -252,12 +257,14 @@ public class SagaOrchestrator {
             }
         }
         if (allOk) {
-            execution.setStatus(SagaStatus.COMPLETED);
+            // 外部步骤已成功，但本地单据尚未提交：停在 ACTIONS_SUCCEEDED，
+            // 由调用方提交成功后再 markCommitted；崩溃窗口由恢复任务收口（TX-03）。
+            execution.setStatus(SagaStatus.ACTIONS_SUCCEEDED);
             execution.setStepLogs(toJson(logs));
             execution.setUpdateTime(System.currentTimeMillis());
             sagaStore.update(execution);
-            increment(completedCounter);
-            log.info("[saga] 正向执行完成: sagaId={}, steps={}", execution.getSagaId(), steps.size());
+            log.info("[saga] 外部步骤全部成功，待本地提交: sagaId={}, steps={}",
+                    execution.getSagaId(), steps.size());
             return;
         }
         // 正向失败：逆序冲正已成功步骤（seq < failedSeq 的全部成功步 + 失败步本身不冲正）
@@ -372,12 +379,44 @@ public class SagaOrchestrator {
     }
 
     /**
-     * 本地单据提交失败后的同步冲正（TX-03 收口）：正向步骤已全部成功，
+     * 本地单据提交成功后的收口：ACTIONS_SUCCEEDED → COMPLETED。
+     * 若更新失败，恢复任务会依据单据已到达目标状态补收口。
+     *
+     * @param sagaId Saga 实例 ID
+     * @return 收口后的状态；记录缺失返回 null
+     */
+    public SagaStatus markCommitted(String sagaId) {
+        if (sagaId == null || sagaId.isBlank()) {
+            return null;
+        }
+        SagaExecution execution = sagaStore.find(sagaId).orElse(null);
+        if (execution == null) {
+            log.warn("[saga] 标记完成时执行记录缺失: sagaId={}", sagaId);
+            return null;
+        }
+        if (execution.getStatus() == SagaStatus.COMPLETED) {
+            return SagaStatus.COMPLETED;
+        }
+        if (execution.getStatus() != SagaStatus.ACTIONS_SUCCEEDED) {
+            log.warn("[saga] 非待提交状态，忽略标记完成: sagaId={}, status={}",
+                    sagaId, execution.getStatus());
+            return execution.getStatus();
+        }
+        execution.setStatus(SagaStatus.COMPLETED);
+        execution.setUpdateTime(System.currentTimeMillis());
+        sagaStore.update(execution);
+        increment(completedCounter);
+        log.info("[saga] 本地提交成功，Saga 完成: sagaId={}", sagaId);
+        return SagaStatus.COMPLETED;
+    }
+
+    /**
+     * 本地单据提交失败后的同步冲正（TX-03 收口）：外部步骤已全部成功，
      * 但流转事务因版本/状态冲突或单据删除未能提交。逆序冲正所有已成功步骤，
      * 使外部副作用与本地状态保持一致；冲正失败转死信。
      *
      * @param sagaId Saga 实例 ID
-     * @return 冲正后的终态（COMPENSATED/DEAD）；记录缺失或非 COMPLETED 时返回既有状态
+     * @return 冲正后的终态（COMPENSATED/DEAD）；记录缺失或非待提交状态时返回既有状态
      */
     public SagaStatus compensateAfterCommitFailure(String sagaId) {
         if (sagaId == null || sagaId.isBlank()) {
@@ -388,7 +427,8 @@ public class SagaOrchestrator {
             log.warn("[saga] 提交失败冲正时执行记录缺失: sagaId={}", sagaId);
             return null;
         }
-        if (execution.getStatus() != SagaStatus.COMPLETED) {
+        if (execution.getStatus() != SagaStatus.ACTIONS_SUCCEEDED
+                && execution.getStatus() != SagaStatus.COMPLETED) {
             // 已完成冲正/死信，或仍在执行（由恢复任务接手），不重复冲正
             return execution.getStatus();
         }

@@ -43,6 +43,14 @@ public interface SagaStore {
      */
     List<SagaExecution> scanStuckExecuting(long updateTimeBefore);
 
+    /**
+     * 扫描滞留 ACTIONS_SUCCEEDED 记录（外部步骤已完成、本地提交待收口）。
+     *
+     * @param updateTimeBefore update_time 上界（含）
+     * @return ACTIONS_SUCCEEDED 且 update_time ≤ 上界的记录
+     */
+    List<SagaExecution> scanActionsSucceeded(long updateTimeBefore);
+
     /** 保存死信记录（整行覆盖写，同 saga 仅一条） */
     void saveDeadLetter(SagaDeadLetter deadLetter);
 

@@ -84,14 +84,14 @@ class SagaOrchestratorTest {
     }
 
     @Test
-    @DisplayName("正向按 seq 顺序执行：3 步全部成功 → COMPLETED（TX-01）")
-    void forward_allStepsSuccess_completed() {
+    @DisplayName("正向按 seq 顺序执行：3 步成功 → ACTIONS_SUCCEEDED，提交后 markCommitted → COMPLETED")
+    void forward_allStepsSuccess_actionsSucceededThenCompleted() {
         stubEndpoints();
 
-        SagaResult result = orchestrator.execute(plan(), DOC, UUID, 100L, 10L,
+        SagaResult result = orchestrator.execute(plan(), DOC, UUID, 1L, 100L, 10L,
                 "alice", "key-forward-1");
 
-        assertThat(result.status()).isEqualTo(SagaStatus.COMPLETED);
+        assertThat(result.status()).isEqualTo(SagaStatus.ACTIONS_SUCCEEDED);
         assertThat(result.sagaId()).startsWith("saga_");
         // 顺序执行：SAP → APS → notify（verify 顺序断言）
         org.mockito.InOrder inOrder = org.mockito.Mockito.inOrder(stepClient);
@@ -99,7 +99,13 @@ class SagaOrchestratorTest {
                 anyString(), any(TxPlan.TxStep.class), anyString());
         inOrder.verify(stepClient).post(org.mockito.ArgumentMatchers.eq(APS_ACTION),
                 anyString(), any(TxPlan.TxStep.class), anyString());
-        // 执行记录落表终态 COMPLETED
+        // 外部步骤完成但本地未提交：不能是 COMPLETED
+        assertThat(sagaStore.find(result.sagaId()).orElseThrow().getStatus())
+                .isEqualTo(SagaStatus.ACTIONS_SUCCEEDED);
+        assertThat(sagaStore.find(result.sagaId()).orElseThrow().getExpectedVersion())
+                .isEqualTo(1L);
+
+        assertThat(orchestrator.markCommitted(result.sagaId())).isEqualTo(SagaStatus.COMPLETED);
         assertThat(sagaStore.find(result.sagaId()).orElseThrow().getStatus())
                 .isEqualTo(SagaStatus.COMPLETED);
     }
@@ -109,7 +115,7 @@ class SagaOrchestratorTest {
     void apsFailed_sapCompensated_reverseOrder() {
         stubEndpoints(APS_ACTION);
 
-        assertThatThrownBy(() -> orchestrator.execute(plan(), DOC, UUID, 100L, 10L,
+        assertThatThrownBy(() -> orchestrator.execute(plan(), DOC, UUID, 1L, 100L, 10L,
                 "alice", "key-compensate-1"))
                 .isInstanceOf(SagaCompensatedException.class);
 
@@ -131,7 +137,7 @@ class SagaOrchestratorTest {
     void compensateFailed_deadLetterPersisted() {
         stubEndpoints(APS_ACTION, SAP_COMPENSATE);
 
-        assertThatThrownBy(() -> orchestrator.execute(plan(), DOC, UUID, 100L, 10L,
+        assertThatThrownBy(() -> orchestrator.execute(plan(), DOC, UUID, 1L, 100L, 10L,
                 "alice", "key-dead-1"))
                 .isInstanceOf(SagaDeadException.class);
 
@@ -147,9 +153,9 @@ class SagaOrchestratorTest {
     void compensateAfterCommitFailure_reversesSucceededSteps() {
         stubEndpoints();
 
-        SagaResult result = orchestrator.execute(plan(), DOC, UUID, 100L, 10L,
+        SagaResult result = orchestrator.execute(plan(), DOC, UUID, 1L, 100L, 10L,
                 "alice", "key-commit-fail-1");
-        assertThat(result.status()).isEqualTo(SagaStatus.COMPLETED);
+        assertThat(result.status()).isEqualTo(SagaStatus.ACTIONS_SUCCEEDED);
 
         SagaStatus status = orchestrator.compensateAfterCommitFailure(result.sagaId());
 
@@ -175,15 +181,16 @@ class SagaOrchestratorTest {
     void idempotentReplay_noDoubleExecution() {
         stubEndpoints();
 
-        SagaResult first = orchestrator.execute(plan(), DOC, UUID, 100L, 10L,
+        SagaResult first = orchestrator.execute(plan(), DOC, UUID, 1L, 100L, 10L,
                 "alice", "key-replay-1");
-        assertThat(first.status()).isEqualTo(SagaStatus.COMPLETED);
+        assertThat(first.status()).isEqualTo(SagaStatus.ACTIONS_SUCCEEDED);
+        orchestrator.markCommitted(first.sagaId());
         // 3 步骤各一次
         verify(stepClient, times(3)).post(anyString(), anyString(),
                 any(TxPlan.TxStep.class), anyString());
 
         // 同幂等键重放：同 saga_id，回放终态，不再出站调用
-        SagaResult second = orchestrator.execute(plan(), DOC, UUID, 100L, 10L,
+        SagaResult second = orchestrator.execute(plan(), DOC, UUID, 1L, 100L, 10L,
                 "alice", "key-replay-1");
         assertThat(second.sagaId()).isEqualTo(first.sagaId());
         assertThat(second.status()).isEqualTo(SagaStatus.COMPLETED);

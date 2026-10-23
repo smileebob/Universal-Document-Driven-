@@ -38,6 +38,7 @@ import com.example.common.infrastructure.tablestore.query.SearchResult;
 import com.example.common.infrastructure.tablestore.query.QuerySpec;
 import com.example.runtime.domain.port.AuditLogStore;
 import com.example.runtime.domain.port.DocConfigGateway;
+import com.example.runtime.domain.saga.SagaStatus;
 import com.example.runtime.domain.saga.TxPlan;
 import com.example.runtime.infrastructure.tablestore.TablestoreDocDataStore;
 import com.example.runtime.infrastructure.tablestore.TablestoreIdempotencyStore;
@@ -58,6 +59,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -96,6 +98,7 @@ class DocTransitionApiTest {
     private RuleExecutor ruleExecutor;
     private MockMvc mockMvc;
     private FakeDocConfigGateway configGateway;
+    private SagaOrchestrator sagaOrchestrator;
     private com.example.runtime.infrastructure.tablestore.TablestoreEntityDataRepository entityRepository;
 
     @BeforeEach
@@ -138,9 +141,10 @@ class DocTransitionApiTest {
             throw new IllegalStateException(e);
         }
 
+        sagaOrchestrator = mock(SagaOrchestrator.class);
         TransitionService transitionService = new TransitionService(
                 redissonClient, configGateway, docDataStore, ruleChecker, auditService,
-                mock(SagaOrchestrator.class), mock(OutboxRelayService.class));
+                sagaOrchestrator, mock(OutboxRelayService.class));
         entityRepository = new com.example.runtime.infrastructure.tablestore
                 .TablestoreEntityDataRepository(template, mapper);
         DocDataService docDataService = new DocDataService(
@@ -402,6 +406,28 @@ class DocTransitionApiTest {
         mockMvc.perform(get("/api/v1/data/doc/{doc}/{uuid}", DOC, draft))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value(ErrorCode.NOT_FOUND.getCode()));
+    }
+
+    @Test
+    @DisplayName("含 Saga 流转：外部步骤 ACTIONS_SUCCEEDED 后提交本地单据，再 markCommitted 收口（TX-03）")
+    void transitionWithSaga_marksCommittedAfterCommit() throws Exception {
+        configGateway.txPlans.add(new TxPlan(DOC, 100L, 10L, List.of(
+                new TxPlan.TxStep(1, "SAP", "http://mock/action",
+                        "http://mock/compensate", 1000L, 0))));
+        when(sagaOrchestrator.execute(anyString(), any(TxPlan.class), anyString(), anyString(),
+                anyLong(), anyLong(), anyLong(), anyString()))
+                .thenReturn(new SagaOrchestrator.SagaResult(
+                        "saga_test", SagaStatus.ACTIONS_SUCCEEDED));
+        String uuid = createPo(100);
+
+        mockMvc.perform(post("/api/v1/data/doc/{doc}/{uuid}/transition", DOC, uuid)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"target_status\": 10, \"event\": \"submit\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.saga_triggered").value(true))
+                .andExpect(jsonPath("$.data.to_status").value(10));
+
+        verify(sagaOrchestrator).markCommitted(anyString());
     }
 
     @Test

@@ -26,6 +26,7 @@ import com.example.runtime.service.IdempotencyService;
 import com.example.runtime.service.event.OutboxRelayService;
 import com.example.runtime.service.saga.SagaOrchestrator;
 import com.example.runtime.service.saga.SagaOrchestrator.SagaCompensatedException;
+import com.example.runtime.service.saga.SagaOrchestrator.SagaResult;
 import com.example.runtime.service.saga.SagaProperties;
 import com.example.runtime.service.saga.SagaStepHttpClient;
 import com.example.runtime.service.saga.SagaStepHttpClient.StepResponse;
@@ -171,7 +172,10 @@ class RuntimeMetricsBindingTest {
         MeterRegistry registry = new SimpleMeterRegistry();
         SagaOrchestrator orchestrator = newOrchestrator(registry);
 
-        orchestrator.execute(plan(), "po", "uuid-s1", 200L, 20L, "alice", "key-s1");
+        SagaResult result = orchestrator.execute(plan(), "po", "uuid-s1", 1L, 200L, 20L,
+                "alice", "key-s1");
+        // 外部步骤成功只到 ACTIONS_SUCCEEDED；本地提交后 markCommitted 才计 completed
+        orchestrator.markCommitted(result.sagaId());
 
         assertThat(registry.get("ddp_saga_execution_total")
                 .tag("result", "completed").counter().count()).isEqualTo(1.0);
@@ -184,7 +188,7 @@ class RuntimeMetricsBindingTest {
         SagaOrchestrator orchestrator = newOrchestrator(registry, "http://mock/aps/action");
 
         assertThatThrownBy(() -> orchestrator.execute(plan(), "po", "uuid-s2",
-                200L, 20L, "alice", "key-s2"))
+                1L, 200L, 20L, "alice", "key-s2"))
                 .isInstanceOf(SagaCompensatedException.class);
 
         assertThat(registry.get("ddp_saga_execution_total")

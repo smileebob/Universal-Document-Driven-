@@ -23,6 +23,9 @@ public class SagaExecution {
     /** 目标状态 */
     private long toStatus;
 
+    /** 规则/Saga 执行前读取的单据版本（恢复提交时的快照版本，防止提交陈旧数据） */
+    private long expectedVersion;
+
     /** 执行状态 */
     private SagaStatus status;
 
@@ -85,6 +88,14 @@ public class SagaExecution {
 
     public void setToStatus(long toStatus) {
         this.toStatus = toStatus;
+    }
+
+    public long getExpectedVersion() {
+        return expectedVersion;
+    }
+
+    public void setExpectedVersion(long expectedVersion) {
+        this.expectedVersion = expectedVersion;
     }
 
     public SagaStatus getStatus() {
